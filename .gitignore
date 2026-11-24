@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+logs/
+data/
+*.pyc
+*.log
+*.egg-info/
+reference/author-private.md
+*.log
+*.egg-info/
+reference/author-private.md
+*.log
+*.egg-info/
+reference/author-private.md

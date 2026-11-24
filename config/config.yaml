@@ -1,0 +1,16 @@
+# Основной движок — облачный OrcaRouter API. Ollama в этой сборке не используется.
+app:
+  host: 127.0.0.1
+  port: 8000
+memory:
+  recent_messages: 20
+  retrieval_results: 5
+  history_days: 7
+  data_dir: data
+llm:
+  engine: orcarouter
+  model: deepseek/deepseek-v4.1-flash-free
+  base_url: https://api.orcarouter.ai/v1
+  prompt_version: latest
+tts:
+  engine: text_stub
