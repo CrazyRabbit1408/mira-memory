@@ -241,21 +241,25 @@ class MemoryManager:
         for sql in FTS_TRIGGER_SQLS:
             self.db.execute(sql)
 
+    def _repopulate_fts(self) -> int:
+        """M2: залить notes_fts заново из notes (внутри текущей транзакции)."""
+        self.db.execute('DELETE FROM notes_fts')
+        self.db.execute('''INSERT INTO notes_fts(rowid,body,fact_key,viewer_id)
+            SELECT id,body,COALESCE(fact_key,''),COALESCE(viewer_id,'') FROM notes''')
+        return int(self.db.execute('SELECT COUNT(*) FROM notes_fts').fetchone()[0])
+
     def _rebuild_fts(self) -> int:
         """M2: полная пересборка notes_fts из notes (источник истины).
 
         Индекс — производные данные, потеря или рассинхронизация не
-        считается повреждением памяти: метод чистит таблицу и заново
+        считается повреждением памяти: метод гарантирует наличие схемы
+        (в т.ч. после ручного удаления таблицы), чистит таблицу и заново
         копирует все строки notes. Возвращает число проиндексированных
         заметок.
         """
         with self.lock, self.db:
             self._ensure_fts_schema()
-            self.db.execute('DELETE FROM notes_fts')
-            self.db.execute('''INSERT INTO notes_fts(rowid,body,fact_key,viewer_id)
-                SELECT id,body,COALESCE(fact_key,''),COALESCE(viewer_id,'') FROM notes''')
-            count = self.db.execute('SELECT COUNT(*) FROM notes_fts').fetchone()[0]
-        return int(count)
+            return self._repopulate_fts()
 
     def _migrate_fts_index(self) -> None:
         """M2: идемпотентная миграция — создать индекс и сверить его с notes.
@@ -271,9 +275,7 @@ class MemoryManager:
             fts_count = self.db.execute('SELECT COUNT(*) FROM notes_fts').fetchone()[0]
             notes_count = self.db.execute('SELECT COUNT(*) FROM notes').fetchone()[0]
             if fts_count != notes_count:
-                self.db.execute('DELETE FROM notes_fts')
-                self.db.execute('''INSERT INTO notes_fts(rowid,body,fact_key,viewer_id)
-                    SELECT id,body,COALESCE(fact_key,''),COALESCE(viewer_id,'') FROM notes''')
+                self._repopulate_fts()
                 self.db.execute("INSERT INTO state(key,value) VALUES('m2_fts',?) "
                                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                                 (json.dumps({'version': 1, 'notes': notes_count,
@@ -417,8 +419,18 @@ class MemoryManager:
         ]
 
     def rebuild_index(self) -> int:
-        """Проверить исходные записи; смысловой индекс ведётся отдельно."""
-        with self.lock: return len(self._records())
+        """M1: честная полная пересборка поискового индекса FTS5 из notes.
+
+        Раньше метод только считал записи (misleading-заглушка), а правки
+        заметок дёргали его после каждой мутации. Теперь он действительно
+        перестраивает производный индекс: гарантирует наличие схемы notes_fts
+        и триггеров (восстановление после ручного удаления), полностью
+        перезаливает строки из notes и возвращает число проиндексированных
+        заметок. Обычные правки не нуждаются в этом методе: индекс ведут
+        триггеры — вызывать rebuild имеет смысл после внешних вмешательств,
+        из «Перестроить поисковый индекс» в панели или /api/rebuild-index.
+        """
+        return self._rebuild_fts()
 
     def save_exchange(self, viewer_id: str, text: str, response: str) -> None:
         """Сохранить вход и ответ одной транзакцией и обновить профиль."""
@@ -429,7 +441,7 @@ class MemoryManager:
             self.db.execute('INSERT INTO messages(viewer_id,speaker,body,created) VALUES(?,?,?,?)',(viewer_id,'kumar',response,now))
             self.db.execute('''INSERT INTO viewers(viewer_id,first_seen,last_seen,count) VALUES(?,?,?,1)
                 ON CONFLICT(viewer_id) DO UPDATE SET last_seen=excluded.last_seen,count=count+1''',(viewer_id,now,now))
-        self.rebuild_index()
+        # M1: rebuild_index после каждой мутации не нужен — FTS5 ведут триггеры.
 
     def recent(self, limit: int = 20, viewer_id: str | None = None) -> list[dict[str, Any]]:
         """Вернуть историю в хронологическом порядке, при необходимости для одного зрителя."""
@@ -460,7 +472,6 @@ class MemoryManager:
             self.db.execute('''INSERT INTO note_versions(note_id,revision,body,viewer_id,fact_key,
                 memory_type,importance,source_kind,confidence,created) VALUES(?,?,?,?,?,?,?,?,?,?)''',
                 (note_id,1,text,viewer_id,fact_key,memory_type,importance,source_kind,confidence,now))
-        self.rebuild_index()
         return note_id
 
     def update_note(self, note_id: int, text: str, viewer_id: str | None, fact_key: str | None,
@@ -533,7 +544,8 @@ class MemoryManager:
                     memory_type,importance,source_kind,confidence,created) VALUES(?,?,?,?,?,?,?,?,?,?)''',
                     (new_id,revision+1,text,viewer_id,fact_key,memory_type,importance,source_kind,confidence,now))
                 result={'mode':'superseded','old_id':note_id,'new_id':new_id}
-        self.rebuild_index()
+        # M1: FTS5-индекс обновляется триггером notes_fts_au, полная пересборка
+        # на горячем пути не нужна.
         return result
 
     def notes(self, include_history: bool=False, limit: int=100) -> list[dict[str, Any]]:
@@ -587,7 +599,7 @@ class MemoryManager:
                     raise ValueError('Эта заметка уже отозвана.')
                 self.db.execute("UPDATE notes SET status='retracted',valid_to=? WHERE id=?",(time.time(),note_id))
             result={'mode':status,'changed':True,'note_id':note_id}
-        self.rebuild_index()
+        # M1: статус не меняет тело заметки — FTS5 актуален сам по себе.
         return result
 
     def note_chain(self, note_id: int, max_depth: int=50) -> list[dict[str, Any]]:
@@ -687,8 +699,7 @@ class MemoryManager:
                 else:
                     self.db.execute("UPDATE notes SET status='retracted',valid_to=? WHERE id=?",(time.time(),note_id))
                     result={'mode':'retracted','note_id':note_id}
-        if result:
-            self.rebuild_index()
+        # M1: отзыв меняет только статус; FTS-фильтр статусов применяется в момент поиска.
         return result
 
     def stale_facts(self, query: str, matches: list[dict[str, Any]] | None=None,

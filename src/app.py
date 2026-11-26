@@ -377,7 +377,7 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
                 m.db.execute('UPDATE viewers SET count=MAX(count-1,0) WHERE viewer_id=?',(row['viewer_id'],))
                 m.db.execute('DELETE FROM viewers WHERE viewer_id=? AND count=0',(row['viewer_id'],))
         if not deleted: raise HTTPException(404,'Сообщение не найдено')
-        m.rebuild_index()
+        # M1: rebuild_index здесь был ложным — сообщения не входят в FTS5-индекс заметок.
         app.state.pipeline.semantic.schedule()
         return {'deleted':True}
     @app.post('/api/chat')
@@ -401,6 +401,17 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
             app.state.pipeline.semantic.schedule()
             return result
         except SemanticError as exc: raise HTTPException(502,str(exc)) from exc
+    @app.post('/api/rebuild-index',dependencies=[Depends(admin_guard)])
+    def rebuild_index() -> dict[str, Any]:
+        """M1: честная полная пересборка FTS5-индекса заметок из notes.
+
+        Кнопка «Перестроить поисковый индекс» в панели. Метод действительно
+        пересоздаёт производный индекс (в т.ч. после ручного удаления
+        notes_fts); источник истины — таблица notes — не меняется.
+        """
+        indexed=app.state.memory.rebuild_index()
+        app.state.pipeline.semantic.schedule()
+        return {'indexed':indexed,'mode':'fts5'}
     @app.get('/api/notes')
     def notes(include_history: bool=False) -> list[dict[str, Any]]:
         """M4: по умолчанию только активные и спорные; ?include_history=true — вся история."""

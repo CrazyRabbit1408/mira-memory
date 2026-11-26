@@ -44,6 +44,9 @@ $('#engine-form').addEventListener('submit',async e=>{e.preventDefault();try{awa
 
 $('#semantic-reindex').addEventListener('click',async e=>{const b=e.currentTarget,err=$('#semantic-error');b.disabled=true;b.textContent='Строим индекс…';err.hidden=true;try{await api('/api/semantic-reindex',{method:'POST'});await refresh();toast('Смысловой индекс обновлён')}catch(error){err.textContent=error.message;err.hidden=false;await refresh()}finally{b.disabled=false;b.textContent='Построить или обновить'}});
 
+// M1: честная пересборка поискового индекса FTS5 из базы заметок.
+$('#rebuild-fts').onclick=async()=>{const b=$('#rebuild-fts');b.disabled=true;try{const r=await api('/api/rebuild-index',{method:'POST'});await refresh();toast(`Поисковый индекс пересобран: ${r.indexed} заметок`)}catch(e){toast(e.message)}finally{b.disabled=false}};
+
 async function refreshKnowledge(){
  const [edges,candidates]=await Promise.all([api('/api/graph'),api('/api/candidates')]);
  const g=$('#graph-items');g.replaceChildren();if(!edges.length)empty(g,'Связей пока нет.');
