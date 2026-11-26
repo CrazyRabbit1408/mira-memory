@@ -126,3 +126,18 @@ def test_zero_importance_and_confidence_in_payload(key_env):
     reference = seen['payload']['messages'][1]['content']
     assert '"важность": 0.0' in reference
     assert '"уверенность": 0.0' in reference
+
+
+# --- C5: честный сброс сессии --------------------------------------------
+
+def test_reset_session_rotates_session_id(key_env):
+    """reset_session() выдаёт новый Session-Id, и он попадает в заголовок."""
+    engine, seen = capture(lambda request: httpx.Response(200, json=ok_response()),
+                           session_id='kumar-panel')
+    engine.generate('раз', [], [], 'neutral', False)
+    first = seen['headers']['x-orcarouter-session-id']
+    assert first == 'kumar-panel'
+    new_id = engine.reset_session()
+    assert new_id != first and new_id.startswith('kumar-panel-')
+    engine.generate('два', [], [], 'neutral', False)
+    assert seen['headers']['x-orcarouter-session-id'] == new_id

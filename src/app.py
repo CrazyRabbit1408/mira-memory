@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -86,6 +87,9 @@ class Pipeline:
         self.lock=threading.Lock()
         self.runtime_generation=0
         self.last_reload=''
+        # C5: сессия OrcaRouter, которую панель создала после честного сброса.
+        # None — используется ORCAROUTER_SESSION_ID из .env.
+        self.orca_session_id: str | None = None
 
     def settings(self) -> dict[str, Any]:
         """Вернуть сохранённые настройки; по умолчанию безопасная заглушка."""
@@ -146,7 +150,7 @@ class Pipeline:
                 row=self.memory.db.execute("SELECT value FROM state WHERE key='emotion'").fetchone()
             emotion=row[0] if row else 'neutral'
             if cfg['engine']=='orcarouter':
-                engine=OrcaRouterEngine(cfg['model'])
+                engine=OrcaRouterEngine(cfg['model'], session_id=self.orca_session_id)
             elif cfg['engine']=='stub':
                 engine=StubLLM()
             else:
@@ -163,15 +167,30 @@ class Pipeline:
                                      if cfg['engine']=='orcarouter' else 'stub')}
 
     def reload_llm(self) -> dict[str, Any]:
-        """Выгрузить текущую модель; следующий запрос загрузит её заново."""
+        """Честный сброс runtime-контекста (C5), без ложных обещаний.
+
+        OrcaRouter: создаётся новый Session-Id, и следующий запрос уходит с
+        заголовком X-OrcaRouter-Session-Id новой сессии. Локальная история
+        сообщений в SQLite при этом сохраняется — сброс не удаляет память.
+        Заглушка состояния не хранит — и об этом говорится прямо.
+        """
         cfg=self.settings()
-        message='Контекст движка сброшен.'
-        stopped=False
-        if cfg['engine']=='orcarouter':
-            message='Сессия OrcaRouter сброшена; следующий запрос начнёт новую runtime-сессию.'
         self.runtime_generation+=1
         self.last_reload=time.strftime('%H:%M:%S')
-        return {'reloaded':True,'model_stopped':stopped,'generation':self.runtime_generation,'message':message}
+        result: dict[str, Any]={'reloaded':True,'model_stopped':False,
+                                'generation':self.runtime_generation}
+        if cfg['engine']=='orcarouter':
+            session_id=f'kumar-panel-{uuid.uuid4().hex[:12]}'
+            self.orca_session_id=session_id
+            result.update({'session_reset':True,'session_id':session_id,
+                'message':f'Создана новая сессия OrcaRouter ({session_id}); '
+                          'следующий запрос уйдёт с новым Session-Id. '
+                          'Локальная история в базе сохранена.'})
+        else:
+            result.update({'session_reset':False,'session_id':None,
+                'message':'Тестовая заглушка не хранит контекст: сбрасывать нечего. '
+                          'Счётчик поколения увеличен.'})
+        return result
 
 def create_app(directory: Path | None=None, lore: Path | None=None, testing: bool=False) -> FastAPI:
     """Создать приложение с изолируемыми путями для тестов."""
@@ -227,7 +246,9 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
             'llm':llm, 'tts':'Текст в файл — без звука',
             'runtime':{'generation':app.state.pipeline.runtime_generation,
                        'last_reload':app.state.pipeline.last_reload,
-                       'tts_stopped':app.state.pipeline.tts.stopped},
+                       'tts_stopped':app.state.pipeline.tts.stopped,
+                       'session_id':(app.state.pipeline.orca_session_id or 'kumar-panel')
+                                    if settings['engine']=='orcarouter' else None},
             'twitch':'Не подключён', 'index':('Слова + смысл (возможна частичная индексация)' if semantic['ready'] else 'Поиск по словам; Ollama отключена'),
             'llm_provider':settings['engine'],
             'api_key_configured':bool(os.getenv('ORCAROUTER_API_KEY')),
