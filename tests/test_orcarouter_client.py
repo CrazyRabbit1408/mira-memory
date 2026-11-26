@@ -111,3 +111,18 @@ def test_missing_key_raises_clear_error(monkeypatch):
     monkeypatch.delenv('ORCAROUTER_API_KEY', raising=False)
     with pytest.raises(EngineError, match='ORCAROUTER_API_KEY'):
         OrcaRouterEngine(DEFAULT_ORCA_MODEL)
+
+
+# --- C2: нулевые значения в payload --------------------------------------
+
+def test_zero_importance_and_confidence_in_payload(key_env):
+    """importance=0/confidence=0 не должны превращаться в 0.5/1.0 (C2)."""
+    engine, seen = capture(lambda request: httpx.Response(200, json=ok_response()))
+    context = [{
+        'id': 'note:1', 'kind': 'note', 'source': 'Заметка #1', 'text': 'ноль важности',
+        'memory_type': 'fact', 'importance': 0.0, 'confidence': 0.0,
+    }]
+    engine.generate('привет', context, [], 'neutral', False)
+    reference = seen['payload']['messages'][1]['content']
+    assert '"важность": 0.0' in reference
+    assert '"уверенность": 0.0' in reference

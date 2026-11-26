@@ -14,6 +14,7 @@ from .config import ROOT
 from typing import Any, Protocol
 import httpx
 from .context import answer_directive
+from .scoring import safe_float
 
 OLLAMA_URL = 'http://127.0.0.1:11434/api/chat'
 MODELS = ('qwen3:latest', 'kumar-brain-7b:latest')
@@ -101,8 +102,8 @@ class OllamaEngine:
                 'источник':str(x['source'])[:200],
                 'тип':str(x.get('memory_type',x.get('kind','unknown')))[:40],
                 'подтип':str(x.get('fragment_kind',''))[:20],
-                'важность':round(float(x.get('importance',0.5) or 0.5),2),
-                'уверенность':round(float(x.get('confidence',1.0) or 1.0),2),
+                'важность':round(safe_float(x.get('importance'),0.5),2),
+                'уверенность':round(safe_float(x.get('confidence'),1.0),2),
                 'текст':str(x['text'])[:700],
             } for x in context[:7]]
             directive=answer_directive(text,context)
@@ -197,8 +198,8 @@ class OrcaRouterEngine:
                 'источник': str(x['source'])[:200],
                 'тип': str(x.get('memory_type', x.get('kind', 'unknown')))[:40],
                 'подтип': str(x.get('fragment_kind', ''))[:20],
-                'важность': round(float(x.get('importance', 0.5) or 0.5), 2),
-                'уверенность': round(float(x.get('confidence', 1.0) or 1.0), 2),
+                'важность': round(safe_float(x.get('importance'), 0.5), 2),
+                'уверенность': round(safe_float(x.get('confidence'), 1.0), 2),
                 'текст': str(x['text'])[:700],
             } for x in context[:7]]
             directive = answer_directive(text, context)

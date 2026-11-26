@@ -27,6 +27,7 @@ from .memory import MemoryManager, MEMORY_TYPES
 from .semantic import SemanticIndex, SemanticError
 from . import knowledge
 from .context import resolve_context
+from .scoring import safe_float
 
 EMOTIONS=['neutral','joy','sadness','fear','anger','surprise','contempt','disgust','love']
 class ChatInput(BaseModel):
@@ -112,7 +113,7 @@ class Pipeline:
                 'source':f'Эфирный фрагмент #{x["id"]}',
                 'memory_type':x.get('memory_type','fact'),
                 'fragment_kind':x.get('fragment_kind','memory'),
-                'importance':float(x.get('importance',0.8) or 0.8),
+                'importance':safe_float(x.get('importance'),0.8),
                 'source_kind':'backstage',
                 'confidence':1.0,
             } for x in stream]

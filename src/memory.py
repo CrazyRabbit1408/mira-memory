@@ -14,6 +14,7 @@ from typing import Any
 import chromadb
 from chromadb.config import Settings
 from .embeddings import stub_embedding, tokens
+from .scoring import safe_float
 from . import knowledge
 
 MEMORY_TYPES = frozenset({
@@ -129,14 +130,14 @@ class MemoryManager:
             {'id':f'message:{r["id"]}', 'kind':'message', 'text':r['body'], 'source':f'Сообщение #{r["id"]}', 'viewer_id':r['viewer_id']} for r in messages
         ] + [{'id':f'note:{r["id"]}', 'kind':'note', 'text':r['body'], 'source':f'Заметка #{r["id"]}',
               'viewer_id':r['viewer_id'] or '', 'fact_key':r['fact_key'] or '', 'revision':r['revision'],
-              'memory_type':r['memory_type'] or 'fact', 'importance':float(r['importance'] or 0.5),
-              'source_kind':r['source_kind'] or 'owner', 'confidence':float(r['confidence'] or 1.0),
+              'memory_type':r['memory_type'] or 'fact', 'importance':safe_float(r['importance'], 0.5),
+              'source_kind':r['source_kind'] or 'owner', 'confidence':safe_float(r['confidence'], 1.0),
               'created':r['created']} for r in notes] + [
             {'id':f'stream:{r["id"]}', 'kind':'stream_memory', 'text':r['body'],
              'source':f'Эфирный фрагмент #{r["id"]}',
              'memory_type':r['memory_type'] or 'fact',
              'fragment_kind':r['fragment_kind'] or 'memory',
-             'importance':float(r['importance'] or 0.8),
+             'importance':safe_float(r['importance'], 0.8),
              'source_kind':'backstage', 'confidence':1.0,
              'created':r['created']} for r in self.db.execute(
                  'SELECT id,body,memory_type,fragment_kind,importance,created '
@@ -206,8 +207,8 @@ class MemoryManager:
             self.db.execute('''INSERT OR IGNORE INTO note_versions(note_id,revision,body,viewer_id,fact_key,
                 memory_type,importance,source_kind,confidence,created) VALUES(?,?,?,?,?,?,?,?,?,?)''',
                 (note_id,row['revision'],row['body'],row['viewer_id'],row['fact_key'],
-                 row['memory_type'] or 'fact',row['importance'] or 0.5,row['source_kind'] or 'owner',
-                 row['confidence'] or 1.0,row['created']))
+                 row['memory_type'] or 'fact',safe_float(row['importance'], 0.5),row['source_kind'] or 'owner',
+                 safe_float(row['confidence'], 1.0),row['created']))
             self.db.execute('''UPDATE notes SET body=?,viewer_id=?,fact_key=?,memory_type=?,
                 importance=?,source_kind=?,confidence=?,revision=revision+1 WHERE id=?''',
                 (text,viewer_id,fact_key,memory_type,importance,source_kind,confidence,note_id))

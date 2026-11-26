@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .scoring import safe_float
+
 
 TOPIC_HINTS: dict[str, tuple[str, ...]] = {
     'drink': ('пь', 'пит', 'напит', 'чай', 'коф', 'сок', 'вод'),
@@ -103,7 +105,7 @@ def resolve_context(query: str, matches: list[dict[str, Any]], limit: int = 7) -
     for item in unique:
         if item.get('kind') in OWNER_KINDS and _fold(item.get('source_kind')) not in {'viewer', 'chat', 'message'}:
             item_topics = topics(str(item.get('text', '')), item.get('fact_key'))
-            if item_topics & qtopics and float(item.get('confidence', 1.0) or 1.0) >= 0.5:
+            if item_topics & qtopics and safe_float(item.get('confidence'), 1.0) >= 0.5:
                 active_topics.update(item_topics & qtopics)
 
     filtered: list[dict[str, Any]] = []
@@ -125,9 +127,9 @@ def resolve_context(query: str, matches: list[dict[str, Any]], limit: int = 7) -
         return (
             _priority(item),
             -overlap,
-            -float(item.get('importance', 0.5) or 0.5),
-            -float(item.get('confidence', 1.0) or 1.0),
-            -float(item.get('word_score', 0.0) or 0.0),
+            -safe_float(item.get('importance'), 0.5),
+            -safe_float(item.get('confidence'), 1.0),
+            -safe_float(item.get('word_score'), 0.0),
             str(item.get('id', '')),
         )
 
