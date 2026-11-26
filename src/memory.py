@@ -2,9 +2,15 @@
 
 SQLite — источник истины; Chroma — восстанавливаемый индекс. Лор персонажа
 индексируется только из отдельной папки. Полный авторский лор не индексируется.
+
+M4: заметки имеют явный жизненный цикл факта (status/valid_from/valid_to/
+superseded_by_id). Правка содержания создаёт новую строку и помечает старую
+(status='superseded'), ничего не удаляя: история изменений сохраняется
+полностью и остаётся видимой через цепочки суперсессий.
 """
 from __future__ import annotations
 import hashlib
+import json
 import re
 import sqlite3
 import threading
@@ -14,7 +20,7 @@ from typing import Any
 import chromadb
 from chromadb.config import Settings
 from .embeddings import stub_embedding, tokens
-from .scoring import safe_float
+from .scoring import safe_float, message_relates_to_fact
 from . import knowledge
 
 MEMORY_TYPES = frozenset({
@@ -26,6 +32,17 @@ def normalize_memory_type(value: str | None) -> str:
     """Return a bounded type for structured memories."""
     value = (value or 'fact').strip().casefold()
     return value if value in MEMORY_TYPES else 'fact'
+
+NOTE_STATUSES = frozenset({'active', 'superseded', 'disputed', 'retracted'})
+
+# Мягкое отзывание допустимо для любой ещё не отозванной строки: отозвать
+# историческую (уже superseded) версию — законное кураторское действие.
+RETRACTABLE = frozenset({'active', 'disputed', 'superseded'})
+
+def normalize_note_status(value: str | None) -> str:
+    """Ограничить статус заметки допустимым перечнем M4."""
+    value = (value or 'active').strip().casefold()
+    return value if value in NOTE_STATUSES else 'active'
 
 def clamp_score(value: float | int | None, default: float = 0.5) -> float:
     """Keep user-editable confidence/importance values in a stable range."""
@@ -88,7 +105,7 @@ class MemoryManager:
         ]:
             if version_columns and name not in version_columns:
                 self.db.execute(f'ALTER TABLE note_versions ADD COLUMN {name} {decl}')
-        self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS note_scope_key ON notes(COALESCE(viewer_id,''),fact_key) WHERE fact_key IS NOT NULL")
+        self._migrate_note_lifecycle()
         # Эфирные фрагменты не должны неожиданно переживать полный перезапуск
         # панели: постоянный канон хранится в notes, а этот слой относится к
         # текущему эфиру.
@@ -98,6 +115,82 @@ class MemoryManager:
         self.client = chromadb.PersistentClient(path=str(self.data / 'chroma'),
             settings=Settings(anonymized_telemetry=False))
 
+
+    def _migrate_note_lifecycle(self) -> None:
+        """M4: идемпотентная миграция Этапа 0 → жизненный цикл фактов.
+
+        Уточнение заказчика: вся миграция выполняется в одной транзакции
+        BEGIN IMMEDIATE — между DROP старого уникального индекса и CREATE
+        нового ни один параллельный запрос не успеет вставить две active-
+        заметки с одним ключом. Пересоздание индекса происходит после
+        бэкфилла valid_from и после схлопывания дублей ключей, но до любых
+        пользовательских INSERT.
+
+        Существующие строки безопасно переносятся: DEFAULT 'active'
+        мгновенно помечает их актуальными, valid_from честно берётся из
+        created. Дубли ключей (возможны в базах, переживших версии до
+        индекса) не удаляются молча: новейшая строка остаётся active,
+        старые помечаются superseded со ссылкой на неё, отчёт пишется в
+        state. Обратимая сторона — tools/downgrade_m4.py.
+        """
+        with self.lock:
+            before = self.db.execute('SELECT COUNT(*) FROM notes').fetchone()[0]
+            self.db.execute('BEGIN IMMEDIATE')
+            try:
+                columns = {r['name'] for r in self.db.execute('PRAGMA table_info(notes)')}
+                for name, decl in [
+                    ('status', "TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','superseded','disputed','retracted'))"),
+                    ('valid_from', 'REAL'),
+                    ('valid_to', 'REAL'),
+                    ('superseded_by_id', 'INTEGER REFERENCES notes(id)'),
+                ]:
+                    if name not in columns:
+                        self.db.execute(f'ALTER TABLE notes ADD COLUMN {name} {decl}')
+                self.db.execute('UPDATE notes SET valid_from=created WHERE valid_from IS NULL')
+                report = self._collapse_duplicate_scope_keys()
+                # Индекс пересоздаётся, только если его определение не содержит
+                # условия статуса: на уже мигрированной базе ничего не трогаем.
+                idx = self.db.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='note_scope_key'").fetchone()
+                if not idx or "status='active'" not in (idx['sql'] or ''):
+                    self.db.execute('DROP INDEX IF EXISTS note_scope_key')
+                    self.db.execute("CREATE UNIQUE INDEX note_scope_key ON notes(COALESCE(viewer_id,''),fact_key) WHERE fact_key IS NOT NULL AND status='active'")
+                self.db.execute("INSERT INTO state(key,value) VALUES('schema_version','m4') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                if report:
+                    self.db.execute("INSERT INTO state(key,value) VALUES('m4_migration_report',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                    (json.dumps(report, ensure_ascii=False),))
+                after = self.db.execute('SELECT COUNT(*) FROM notes').fetchone()[0]
+                if after != before:
+                    raise RuntimeError('Миграция M4 изменила количество заметок — откат.')
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+
+    def _collapse_duplicate_scope_keys(self) -> list[dict[str, Any]]:
+        """Схлопнуть дубли одного ключа факта: новейшая строка остаётся active.
+
+        Ничего не удаляется: старые дубли помечаются status='superseded'
+        со ссылкой на новейшую строку и valid_to, равным created новейшей
+        (момент, когда появился более свежий факт). Возвращённый отчёт
+        попадает в state('m4_migration_report').
+        """
+        rows = self.db.execute('''SELECT id,body,viewer_id,fact_key,created FROM notes
+            WHERE fact_key IS NOT NULL ORDER BY COALESCE(viewer_id,''),fact_key,created DESC,id DESC''').fetchall()
+        groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
+        for r in rows:
+            groups.setdefault((r['viewer_id'] or '', r['fact_key']), []).append(r)
+        report: list[dict[str, Any]] = []
+        for (viewer, key), items in groups.items():
+            if len(items) < 2:
+                continue
+            keeper = items[0]
+            for stale in items[1:]:
+                self.db.execute("UPDATE notes SET status='superseded',valid_to=?,superseded_by_id=? WHERE id=?",
+                                (keeper['created'], keeper['id'], stale['id']))
+            report.append({'fact_key': key, 'viewer_id': viewer or None,
+                           'kept_id': keeper['id'],
+                           'superseded_ids': [s['id'] for s in items[1:]]})
+        return report
 
     def close(self) -> None:
         """Закрыть базу данных."""
@@ -124,15 +217,21 @@ class MemoryManager:
     def _records(self) -> list[dict[str, Any]]:
         cutoff = time.time() - self.history_days * 86400
         messages = self.db.execute('SELECT id,body,viewer_id FROM messages WHERE speaker=? AND created>=?', ('viewer',cutoff)).fetchall()
+        # В поисковый индекс попадают только актуальные и спорные заметки:
+        # выдача поиска — это «текущая правда». Устаревшие (superseded) и
+        # отозванные (retracted) факты не ищутся как факты, но участвуют в
+        # конфликте через MemoryManager.stale_facts().
         notes = self.db.execute('''SELECT id,body,viewer_id,fact_key,revision,memory_type,
-            importance,source_kind,confidence,created FROM notes''').fetchall()
+            importance,source_kind,confidence,created,status,valid_from,valid_to,superseded_by_id
+            FROM notes WHERE status IN ('active','disputed')''').fetchall()
         return self.lore_chunks() + knowledge.records(self.db) + [
             {'id':f'message:{r["id"]}', 'kind':'message', 'text':r['body'], 'source':f'Сообщение #{r["id"]}', 'viewer_id':r['viewer_id']} for r in messages
         ] + [{'id':f'note:{r["id"]}', 'kind':'note', 'text':r['body'], 'source':f'Заметка #{r["id"]}',
               'viewer_id':r['viewer_id'] or '', 'fact_key':r['fact_key'] or '', 'revision':r['revision'],
               'memory_type':r['memory_type'] or 'fact', 'importance':safe_float(r['importance'], 0.5),
               'source_kind':r['source_kind'] or 'owner', 'confidence':safe_float(r['confidence'], 1.0),
-              'created':r['created']} for r in notes] + [
+              'created':r['created'], 'status':r['status'] or 'active', 'valid_to':r['valid_to'],
+              'superseded_by_id':r['superseded_by_id']} for r in notes] + [
             {'id':f'stream:{r["id"]}', 'kind':'stream_memory', 'text':r['body'],
              'source':f'Эфирный фрагмент #{r["id"]}',
              'memory_type':r['memory_type'] or 'fact',
@@ -181,8 +280,9 @@ class MemoryManager:
         with self.lock, self.db:
             now=time.time()
             cur=self.db.execute('''INSERT INTO notes(body,created,viewer_id,fact_key,memory_type,
-                importance,source_kind,confidence) VALUES(?,?,?,?,?,?,?,?)''',
-                (text,now,viewer_id,fact_key,memory_type,importance,source_kind,confidence))
+                importance,source_kind,confidence,status,valid_from,valid_to,superseded_by_id)
+                VALUES(?,?,?,?,?,?,?,?, 'active',?,NULL,NULL)''',
+                (text,now,viewer_id,fact_key,memory_type,importance,source_kind,confidence,now))
             note_id=int(cur.lastrowid or 0)
             self.db.execute('''INSERT INTO note_versions(note_id,revision,body,viewer_id,fact_key,
                 memory_type,importance,source_kind,confidence,created) VALUES(?,?,?,?,?,?,?,?,?,?)''',
@@ -192,37 +292,167 @@ class MemoryManager:
 
     def update_note(self, note_id: int, text: str, viewer_id: str | None, fact_key: str | None,
                     revision: int, memory_type: str = 'fact', importance: float = 0.5,
-                    source_kind: str = 'owner', confidence: float = 1.0) -> bool:
-        """Обновить заметку только если её версия ещё актуальна."""
+                    source_kind: str = 'owner', confidence: float = 1.0) -> dict[str, Any] | None:
+        """M4: изменить заметку с учётом жизненного цикла факта.
+
+        Изменение текста или ключа факта — суперсессия: старая строка
+        помечается status='superseded' (valid_to=now), новая создаётся со
+        status='active' и сквозным номером ревизии; старая строка не
+        удаляется, история сохраняется полностью. Правка только
+        метаданных (важность/уверенность/тип/источник при том же тексте и
+        ключе) остаётся правкой на месте без новой версии.
+
+        Возвращает {'mode': 'superseded'|'edited', 'old_id', 'new_id'} или
+        None, если заметки нет. Несовпадение ревизии — ValueError (409);
+        попытка править устаревшую/отозванную строку — ValueError.
+        """
         viewer_id=(viewer_id or '').strip() or None
         fact_key=(fact_key or '').strip().casefold() or None
         memory_type=normalize_memory_type(memory_type)
         importance=clamp_score(importance)
         source_kind=(source_kind or 'owner').strip()[:40] or 'owner'
         confidence=clamp_score(confidence, 1.0)
+        result: dict[str, Any] | None = None
         with self.lock, self.db:
             row=self.db.execute('SELECT * FROM notes WHERE id=?',(note_id,)).fetchone()
-            if not row: return False
+            if not row: return None
             if row['revision']!=revision: raise ValueError('Заметка уже изменена. Обновите страницу и повторите.')
-            self.db.execute('''INSERT OR IGNORE INTO note_versions(note_id,revision,body,viewer_id,fact_key,
-                memory_type,importance,source_kind,confidence,created) VALUES(?,?,?,?,?,?,?,?,?,?)''',
-                (note_id,row['revision'],row['body'],row['viewer_id'],row['fact_key'],
-                 row['memory_type'] or 'fact',safe_float(row['importance'], 0.5),row['source_kind'] or 'owner',
-                 safe_float(row['confidence'], 1.0),row['created']))
-            self.db.execute('''UPDATE notes SET body=?,viewer_id=?,fact_key=?,memory_type=?,
-                importance=?,source_kind=?,confidence=?,revision=revision+1 WHERE id=?''',
-                (text,viewer_id,fact_key,memory_type,importance,source_kind,confidence,note_id))
-            self.db.execute('''INSERT OR REPLACE INTO note_versions(note_id,revision,body,viewer_id,fact_key,
-                memory_type,importance,source_kind,confidence,created) VALUES(?,?,?,?,?,?,?,?,?,?)''',
-                (note_id,revision+1,text,viewer_id,fact_key,memory_type,importance,source_kind,confidence,time.time()))
+            current_status=row['status'] or 'active'
+            if current_status in ('superseded','retracted'):
+                pointer=row['superseded_by_id']
+                raise ValueError('Эта версия устарела и не редактируется.'
+                                 + (f' Актуальная версия — заметка #{pointer}.' if pointer else ''))
+            now=time.time()
+            content_changed = text!=row['body'] or fact_key!=(row['fact_key'] or None)
+            if not content_changed:
+                # Правка метаданных на месте: содержание и ключ не трогаем.
+                self.db.execute('''INSERT OR IGNORE INTO note_versions(note_id,revision,body,viewer_id,fact_key,
+                    memory_type,importance,source_kind,confidence,created) VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                    (note_id,row['revision'],row['body'],row['viewer_id'],row['fact_key'],
+                     row['memory_type'] or 'fact',safe_float(row['importance'], 0.5),row['source_kind'] or 'owner',
+                     safe_float(row['confidence'], 1.0),row['created']))
+                self.db.execute('''UPDATE notes SET viewer_id=?,memory_type=?,
+                    importance=?,source_kind=?,confidence=?,revision=revision+1 WHERE id=?''',
+                    (viewer_id,memory_type,importance,source_kind,confidence,note_id))
+                self.db.execute('''INSERT OR REPLACE INTO note_versions(note_id,revision,body,viewer_id,fact_key,
+                    memory_type,importance,source_kind,confidence,created) VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                    (note_id,revision+1,row['body'],viewer_id,row['fact_key'],memory_type,importance,source_kind,confidence,now))
+                result={'mode':'edited','old_id':note_id,'new_id':note_id}
+            else:
+                # Суперсессия. Порядок внутри транзакции важен: сначала старая
+                # строка покидает статус active (иначе уникальный индекс
+                # не пустит новую строку с тем же ключом факта).
+                self.db.execute("UPDATE notes SET status='superseded',valid_to=? WHERE id=?",(now,note_id))
+                cur=self.db.execute('''INSERT INTO notes(body,created,viewer_id,fact_key,memory_type,
+                    importance,source_kind,confidence,revision,status,valid_from,valid_to,superseded_by_id)
+                    VALUES(?,?,?,?,?,?,?,?,?,'active',?,NULL,NULL)''',
+                    (text,now,viewer_id,fact_key,memory_type,importance,source_kind,confidence,row['revision']+1,now))
+                new_id=int(cur.lastrowid or 0)
+                # Прямая ссылка «старая → актуальная» (решение заказчика):
+                # вопрос «что сейчас верно?» отвечает одним запросом.
+                self.db.execute('UPDATE notes SET superseded_by_id=? WHERE id=?',(new_id,note_id))
+                self.db.execute('''INSERT OR IGNORE INTO note_versions(note_id,revision,body,viewer_id,fact_key,
+                    memory_type,importance,source_kind,confidence,created) VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                    (note_id,row['revision'],row['body'],row['viewer_id'],row['fact_key'],
+                     row['memory_type'] or 'fact',safe_float(row['importance'], 0.5),row['source_kind'] or 'owner',
+                     safe_float(row['confidence'], 1.0),row['created']))
+                self.db.execute('''INSERT OR REPLACE INTO note_versions(note_id,revision,body,viewer_id,fact_key,
+                    memory_type,importance,source_kind,confidence,created) VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                    (new_id,revision+1,text,viewer_id,fact_key,memory_type,importance,source_kind,confidence,now))
+                result={'mode':'superseded','old_id':note_id,'new_id':new_id}
         self.rebuild_index()
-        return True
+        return result
 
-    def notes(self) -> list[dict[str, Any]]:
-        """Вернуть заметки владельца."""
+    def notes(self, include_history: bool=False, limit: int=100) -> list[dict[str, Any]]:
+        """M4: вернуть заметки; по умолчанию — только актуальные.
+
+        include_history=True добавляет superseded и retracted строки
+        (просмотр истории оператором). Сортировка — от новых к старым.
+        """
+        cap=max(1,min(int(limit),500 if include_history else 100))
         with self.lock:
-            return [dict(r) for r in self.db.execute('''SELECT id,body,created,viewer_id,fact_key,revision,
-                memory_type,importance,source_kind,confidence FROM notes ORDER BY id DESC LIMIT 100''')]
+            if include_history:
+                rows=self.db.execute('''SELECT id,body,created,viewer_id,fact_key,revision,
+                    memory_type,importance,source_kind,confidence,status,valid_from,valid_to,superseded_by_id
+                    FROM notes ORDER BY id DESC LIMIT ?''',(cap,)).fetchall()
+            else:
+                rows=self.db.execute('''SELECT id,body,created,viewer_id,fact_key,revision,
+                    memory_type,importance,source_kind,confidence,status,valid_from,valid_to,superseded_by_id
+                    FROM notes WHERE status IN ('active','disputed') ORDER BY id DESC LIMIT ?''',(cap,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def set_note_status(self, note_id: int, status: str) -> dict[str, Any] | None:
+        """M4: ручная кураторская пометка оператора (решение заказчика).
+
+        Разрешённые переходы: active→disputed (спорная пометка),
+        active/disputed→retracted (мягкое отзывание), disputed/retracted→
+        active (оператор передумал; valid_to сбрасывается). superseded не
+        переводится в active вручную — у неё есть актуальная замена.
+        """
+        status=normalize_note_status(status)
+        result: dict[str, Any] | None = None
+        with self.lock, self.db:
+            row=self.db.execute('SELECT status FROM notes WHERE id=?',(note_id,)).fetchone()
+            if not row: return None
+            current=row['status'] or 'active'
+            if status==current:
+                return {'mode':current,'changed':False}
+            if status=='active':
+                if current not in ('disputed','retracted'):
+                    raise ValueError('Вернуть в актуальные можно только спорную или отозванную заметку.')
+                self.db.execute('UPDATE notes SET status=?,valid_to=NULL WHERE id=?',(status,note_id))
+            elif status=='disputed':
+                if current!='active':
+                    raise ValueError('Пометить спорной можно только актуальную заметку.')
+                self.db.execute('UPDATE notes SET status=? WHERE id=?',(status,note_id))
+            else:  # retracted
+                if current not in RETRACTABLE:
+                    raise ValueError('Эта заметка уже отозвана.')
+                self.db.execute("UPDATE notes SET status='retracted',valid_to=? WHERE id=?",(time.time(),note_id))
+            result={'mode':status,'changed':True,'note_id':note_id}
+        self.rebuild_index()
+        return result
+
+    def note_chain(self, note_id: int, max_depth: int=50) -> list[dict[str, Any]]:
+        """M4: версии цепочки суперсессий от любой её точки.
+
+        Обход двусторонний: в прошлое (строки, для которых текущая заметка
+        является заменой) и в будущее (по links superseded_by_id).
+        Связь старая→новая делает прыжок к актуальной версии O(1); обход
+        в прошлое покрывает кнопку «Просмотреть историю версий». Защита
+        от циклов и ограничение глубины — обязательны.
+        """
+        with self.lock:
+            nodes: dict[int, sqlite3.Row] = {}
+            pending=[note_id]
+            depth=0
+            while pending and depth<max_depth:
+                current=pending.pop(0); depth+=1
+                if current in nodes: continue
+                row=self.db.execute('SELECT * FROM notes WHERE id=?',(current,)).fetchone()
+                if not row: continue
+                nodes[current]=row
+                pending.append(row['superseded_by_id'])  # в будущее
+                for parent in self.db.execute('SELECT id FROM notes WHERE superseded_by_id=? ORDER BY id',(current,)).fetchall():
+                    pending.append(parent['id'])  # в прошлое
+            versions: list[dict[str, Any]] = []
+            for node in nodes.values():
+                status=node['status'] or 'active'
+                found=False
+                for v in self.db.execute('''SELECT revision,body,viewer_id,fact_key,memory_type,importance,
+                    source_kind,confidence,created FROM note_versions WHERE note_id=? ORDER BY revision DESC''',(node['id'],)):
+                    found=True
+                    versions.append({'note_id':node['id'],'status':status,'superseded_by_id':node['superseded_by_id'],
+                                     **dict(v)})
+                if not found:
+                    # Предмиграционная строка без истории: сама строка — версия.
+                    versions.append({'note_id':node['id'],'status':status,'superseded_by_id':node['superseded_by_id'],
+                                     'revision':node['revision'],'body':node['body'],'viewer_id':node['viewer_id'],
+                                     'fact_key':node['fact_key'],'memory_type':node['memory_type'] or 'fact',
+                                     'importance':safe_float(node['importance'],0.5),'source_kind':node['source_kind'] or 'owner',
+                                     'confidence':safe_float(node['confidence'],1.0),'created':node['created']})
+            versions.sort(key=lambda x: (-x.get('revision',0), x['note_id']))
+            return versions
 
     def add_stream_memory(self, text: str, memory_type: str = 'fact',
                           fragment_kind: str = 'memory', importance: float = 0.8) -> int:
@@ -253,12 +483,86 @@ class MemoryManager:
             cur=self.db.execute('UPDATE stream_memories SET active=0 WHERE active=1')
             return int(cur.rowcount or 0)
 
-    def delete_note(self, note_id: int) -> bool:
-        """Удалить заметку и её копию из поискового индекса."""
+    def delete_note(self, note_id: int, hard: bool=False) -> dict[str, Any] | None:
+        """M4: по умолчанию — мягкое отзывание (решение заказчика).
+
+        «Ничто не исчезает бесследно»: отзыв (status='retracted',
+        valid_to=now) сохраняет строку и её историю; отозванная заметка
+        исключается из поискового индекса. hard=True — физическое удаление
+        строки и её note_versions (CASCADE) только для PII и явных
+        нарушений правил платформы.
+        """
+        result: dict[str, Any] | None = None
         with self.lock, self.db:
-            deleted=self.db.execute('DELETE FROM notes WHERE id=?',(note_id,)).rowcount > 0
-        self.rebuild_index()
-        return deleted
+            row=self.db.execute('SELECT status FROM notes WHERE id=?',(note_id,)).fetchone()
+            if not row: return None
+            if hard:
+                if self.db.execute('DELETE FROM notes WHERE id=?',(note_id,)).rowcount>0:
+                    result={'mode':'hard','note_id':note_id}
+            else:
+                current=row['status'] or 'active'
+                if current=='retracted':
+                    result={'mode':'already-retracted','note_id':note_id}
+                else:
+                    self.db.execute("UPDATE notes SET status='retracted',valid_to=? WHERE id=?",(time.time(),note_id))
+                    result={'mode':'retracted','note_id':note_id}
+        if result:
+            self.rebuild_index()
+        return result
+
+    def stale_facts(self, query: str, matches: list[dict[str, Any]] | None=None,
+                    viewer_id: str | None=None, limit: int=6) -> list[dict[str, Any]]:
+        """M4: устаревшие факты, относящиеся к запросу (без поискового индекса).
+
+        Два источника:
+        1) предки в цепочках суперсессий среди найденных active-заметок —
+           их тела образуют часть «Ранее было сказано…»;
+        2) прямой лексический отбор по retracted-заметкам, которые
+           исключены из обычного индекса (приватность отзыва), и по
+           superseded, до которых цепочка не доходит.
+        Отбор детерминированный (scoring.message_relates_to_fact), без
+        эмбеддингов: смысловой поиск (M3) не затрагивается.
+        """
+        stale: dict[int, dict[str, Any]] = {}
+        with self.lock:
+            # 1) Цепочки найденных актуальных заметок.
+            for item in matches or []:
+                if item.get('kind')!='note': continue
+                raw=str(item.get('id',''))
+                if not raw.startswith('note:'): continue
+                try: root=int(raw.split(':',1)[1])
+                except ValueError: continue
+                row=self.db.execute('SELECT * FROM notes WHERE id=?',(root,)).fetchone()
+                seen: set[int]=set()
+                while row is not None and row['id'] not in seen:
+                    seen.add(row['id'])
+                    parent=self.db.execute('SELECT * FROM notes WHERE superseded_by_id=? ORDER BY id LIMIT 1',(row['id'],)).fetchone()
+                    if parent is not None and parent['status']=='superseded':
+                        stale.setdefault(parent['id'], self._stale_record(parent))
+                    row=parent
+            # 2) Лексический отбор по всем устаревшим строкам.
+            rows=self.db.execute('''SELECT * FROM notes WHERE status IN ('superseded','retracted')''').fetchall()
+            for r in rows:
+                if viewer_id and (r['viewer_id'] or '') not in ('', viewer_id):
+                    continue
+                if message_relates_to_fact(query, r['body'], r['fact_key']):
+                    stale.setdefault(r['id'], self._stale_record(r))
+                    if len(stale)>=limit*3: break
+        ranked=sorted(stale.values(), key=lambda x: (-safe_float(x.get('importance'),0.5), -x['created']))[:limit]
+        return ranked
+
+    def _stale_record(self, row: sqlite3.Row) -> dict[str, Any]:
+        """Собрать запись устаревшего факта с данными актуальной замены."""
+        replacement=None
+        if row['superseded_by_id']:
+            nr=self.db.execute('SELECT id,body FROM notes WHERE id=?',(row['superseded_by_id'],)).fetchone()
+            if nr is not None: replacement={'id':nr['id'],'body':nr['body']}
+        return {'id':f'note:{row["id"]}','kind':'stale_fact','note_id':row['id'],'text':row['body'],
+                'fact_key':row['fact_key'],'status':row['status'] or 'active',
+                'superseded_by_id':row['superseded_by_id'],'valid_to':row['valid_to'],
+                'created':row['created'],'viewer_id':row['viewer_id'] or '',
+                'importance':safe_float(row['importance'],0.5),'replacement':replacement,
+                'source':f'Заметка #{row["id"]} ({"заменена" if row["status"]=="superseded" else "отозвана"})'}
 
     def search(self, query: str, limit: int=5, viewer_id: str | None=None) -> list[dict[str, Any]]:
         """Словесный резервный поиск по разрешённым текущим записям."""
@@ -268,12 +572,15 @@ class MemoryManager:
             return lexical_rank(query,records,limit)
 
     def counts(self) -> dict[str, int]:
-        """Вернуть количество записей по типам."""
+        """Вернуть количество записей по типам и статусам жизненного цикла."""
         with self.lock:
             type_rows=self.db.execute('SELECT memory_type,COUNT(*) AS count FROM notes GROUP BY memory_type').fetchall()
+            status_rows=self.db.execute('SELECT status,COUNT(*) AS count FROM notes GROUP BY status').fetchall()
             return {'messages':self.db.execute('SELECT COUNT(*) FROM messages').fetchone()[0],
                     'viewers':self.db.execute('SELECT COUNT(*) FROM viewers').fetchone()[0],
                     'notes':self.db.execute('SELECT COUNT(*) FROM notes').fetchone()[0],
+                    'active_notes':self.db.execute("SELECT COUNT(*) FROM notes WHERE status='active'").fetchone()[0],
+                    'note_statuses':{r['status'] or 'active':r['count'] for r in status_rows},
                     'stream_memories':self.db.execute(
                         'SELECT COUNT(*) FROM stream_memories WHERE active=1').fetchone()[0],
                     'lore':len(self.lore_chunks()),

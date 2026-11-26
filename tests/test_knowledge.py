@@ -64,7 +64,9 @@ def test_note_revision(c):
     assert c.put(f'/api/notes/{i}',json={'text':'вода','revision':1,'fact_key':'напиток'}).status_code==200
     assert [v['body'] for v in c.get(f'/api/notes/{i}/versions').json()]==['вода','чай']
     assert c.put(f'/api/notes/{i}',json={'text':'сок','revision':1}).status_code==409
-    c.delete(f'/api/notes/{i}');assert c.get(f'/api/notes/{i}/versions').json()==[]
+    # M4: удаление — это мягкое отзывание; строка и история изменений сохраняются.
+    assert c.delete(f'/api/notes/{i}').json()['mode']=='retracted'
+    assert [v['body'] for v in c.get(f'/api/notes/{i}/versions').json()]==['вода','чай']
 
 def test_demo_is_explicit_and_idempotent(c):
     assert not c.get('/api/messages').json();assert c.post('/api/demo').status_code==200

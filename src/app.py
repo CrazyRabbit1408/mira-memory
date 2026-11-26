@@ -410,10 +410,12 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
         app.state.pipeline.semantic.schedule()
         return {'updated':True}
     @app.delete('/api/notes/{note_id}',dependencies=[Depends(admin_guard)])
-    def delete_note(note_id: int) -> dict[str,bool]:
-        if not app.state.memory.delete_note(note_id): raise HTTPException(404,'Заметка не найдена')
+    def delete_note(note_id: int) -> dict[str,Any]:
+        """M4: мягкое отзывание (retracted) с сохранением истории."""
+        result=app.state.memory.delete_note(note_id)
+        if not result: raise HTTPException(404,'Заметка не найдена')
         app.state.pipeline.semantic.schedule()
-        return {'deleted':True}
+        return result
     @app.get('/api/lore')
     def lore_list() -> list[dict[str, Any]]:
         return app.state.memory.lore_chunks()
@@ -443,10 +445,9 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
         return {'updated':True}
     @app.get('/api/notes/{note_id}/versions')
     def note_versions(note_id: int) -> list[dict[str,Any]]:
+        """M4: история версий по всей цепочке суперсессий (двусторонний обход)."""
         m=app.state.memory
-        with m.lock: return [dict(r) for r in m.db.execute('''SELECT revision,body,viewer_id,fact_key,
-            memory_type,importance,source_kind,confidence,created FROM note_versions
-            WHERE note_id=? ORDER BY revision DESC''',(note_id,))]
+        return m.note_chain(note_id)
     @app.post('/api/demo',dependencies=[Depends(admin_guard)])
     def load_demo() -> dict[str,int]:
         m=app.state.memory

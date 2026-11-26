@@ -42,7 +42,9 @@ def test_slot_conflict_and_revision(client):
     assert client.post('/api/notes',json={**data,'viewer_id':'bob'}).status_code==200
     r=client.put(f'/api/notes/{i}',json={**data,'text':'Любит сок','revision':1}); assert r.status_code==200
     assert client.put(f'/api/notes/{i}',json={**data,'revision':1}).status_code==409
-    assert client.get('/api/notes').json()[-1]['body']=='Любит сок'
+    # M4: правка текста создаёт новую строку-версию (старая помечается superseded),
+    # поэтому актуальная запись — первая в списке (id DESC), а не последняя.
+    assert client.get('/api/notes').json()[0]['body']=='Любит сок'
 
 def test_structured_memory_metadata_and_revision(client):
     r=client.post('/api/notes',json={
@@ -83,7 +85,10 @@ def test_index_background_add_edit_delete(client):
     i=client.post('/api/notes',json={'text':'Мира нашла редкий фонарь','fact_key':'фонарь'}).json()['id'];wait_fresh(client)
     assert any(r['text']=='Мира нашла редкий фонарь' for r in client.get('/api/search?q=фонарь').json())
     assert client.put(f'/api/notes/{i}',json={'text':'Мира нашла старый фонарь','fact_key':'фонарь','revision':1}).status_code==200
-    wait_fresh(client); assert client.delete(f'/api/notes/{i}').status_code==200;wait_fresh(client)
+    # M4: правка текста создала новую строку-версию; для проверки исчезновения
+    # из поиска отзываем именно актуальную версию, а не устаревшую строку.
+    current=client.get('/api/notes').json()[0]['id']
+    wait_fresh(client); assert client.delete(f'/api/notes/{current}').status_code==200;wait_fresh(client)
     assert not any(r['kind']=='note' for r in client.get('/api/search?q=фонарь').json())
 
 def test_no_leak_on_stale_and_failed_index(client,monkeypatch):
