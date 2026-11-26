@@ -143,7 +143,8 @@ class Pipeline:
                     'search_mode':retrieval['mode'], 'search_warning':retrieval['warning'],
                     'prompt_messages':getattr(engine,'last_messages',[]),
                     'usage':getattr(engine,'last_usage',{}),
-                    'prompt_source':'key-bound: kumar-live' if cfg['engine']=='orcarouter' else 'stub'}
+                    'prompt_source':(f'local: config/character.md ({getattr(engine,"persona_sha","")})'
+                                     if cfg['engine']=='orcarouter' else 'stub')}
 
     def reload_llm(self) -> dict[str, Any]:
         """Выгрузить текущую модель; следующий запрос загрузит её заново."""
