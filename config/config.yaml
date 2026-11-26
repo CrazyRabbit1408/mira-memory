@@ -11,6 +11,9 @@ llm:
   engine: orcarouter
   model: deepseek/deepseek-v4.1-flash-free
   base_url: https://api.orcarouter.ai/v1
-  prompt_version: latest
+  # Источник истины о личности — локальный config/character.md: панель сама
+  # собирает системный промпт и отправляет его в каждом запросе, версия
+  # характера фиксируется отпечатком SHA-256 (см. prompt_sha в src/engines.py).
+  # Ключ prompt_version: latest больше не используется и убран намеренно.
 tts:
   engine: text_stub
