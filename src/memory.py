@@ -189,7 +189,7 @@ class MemoryManager:
                                 (keeper['created'], keeper['id'], stale['id']))
             report.append({'fact_key': key, 'viewer_id': viewer or None,
                            'kept_id': keeper['id'],
-                           'superseded_ids': [s['id'] for s in items[1:]]})
+                           'superseded_ids': sorted(s['id'] for s in items[1:])})
         return report
 
     def close(self) -> None:
@@ -390,6 +390,10 @@ class MemoryManager:
         переводится в active вручную — у неё есть актуальная замена.
         """
         status=normalize_note_status(status)
+        if status=='superseded':
+            # Суперсессия — внутреннее состояние, которое устанавливает только
+            # правка содержания; вручную переводить строки в него нельзя.
+            raise ValueError('Статус superseded устанавливается автоматически при правке факта.')
         result: dict[str, Any] | None = None
         with self.lock, self.db:
             row=self.db.execute('SELECT status FROM notes WHERE id=?',(note_id,)).fetchone()
