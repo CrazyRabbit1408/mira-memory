@@ -164,7 +164,7 @@ def test_reopen(tmp_path,monkeypatch):
 
 def test_chat_failure_does_not_save(client,monkeypatch):
     from src.engines import StubLLM,EngineError
-    monkeypatch.setattr(StubLLM,'generate',lambda *args: (_ for _ in ()).throw(EngineError('нет связи')))
+    monkeypatch.setattr(StubLLM,'generate',lambda *args, **kwargs: (_ for _ in ()).throw(EngineError('нет связи')))
     client.post('/api/engine-settings',json={'engine':'stub','model':'stub','thinking':False})
     assert client.post('/api/chat',json={'viewer':'a','text':'привет'}).status_code==502
     assert client.get('/api/messages').json()==[]

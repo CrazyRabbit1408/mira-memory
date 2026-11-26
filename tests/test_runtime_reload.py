@@ -59,7 +59,7 @@ def test_chat_uses_pipeline_session_after_reload(client, monkeypatch):
             self.last_usage = {}
             self.persona_sha = 'deadbeef'
 
-        def generate(self, text, context, history, emotion, thinking):
+        def generate(self, text, context, history, emotion, thinking, conflict_notice=None):
             return 'фейковый ответ'
 
     monkeypatch.setattr(app_module, 'OrcaRouterEngine', FakeOrcaEngine)

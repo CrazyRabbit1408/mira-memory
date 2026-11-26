@@ -92,7 +92,7 @@ def test_stream_memory_zero_importance_reaches_engine_verbatim(client, monkeypat
     from src.engines import StubLLM
     seen_contexts = []
 
-    def fake_generate(self, text, context, history, emotion, thinking):
+    def fake_generate(self, text, context, history, emotion, thinking, conflict_notice=None):
         seen_contexts.append(context)
         return 'ответ Кумара'
 

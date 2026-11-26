@@ -28,7 +28,7 @@ from .engines import (
 from .memory import MemoryManager, MEMORY_TYPES
 from .semantic import SemanticIndex, SemanticError
 from . import knowledge
-from .context import resolve_context
+from .context import resolve_context, invalidate_history, conflicting_facts_block
 from .scoring import safe_float
 
 EMOTIONS=['neutral','joy','sadness','fear','anger','surprise','contempt','disgust','love']
@@ -67,6 +67,10 @@ class EngineSettingsInput(BaseModel):
 class EmotionInput(BaseModel):
     """Имя ручной эмоции."""
     emotion: str
+
+class NoteStatusInput(BaseModel):
+    """M4: ручная кураторская пометка статуса заметки."""
+    status: str = Field(min_length=1,max_length=20)
 
 class StreamMemoryInput(BaseModel):
     """Фрагмент, который оператор вводит прямо во время эфира."""
@@ -143,9 +147,21 @@ class Pipeline:
             if suppressed:
                 retrieval['warning']=(retrieval['warning']+f' {suppressed} устаревший фрагмент скрыт актуальной заметкой владельца.').strip()
             history=self.memory.recent(20, viewer_id=viewer)
-            if any(x.get('kind')=='note' and x.get('revision',1)>1 for x in matches):
-                history=[x for x in history if x['speaker']!='kumar']
-                retrieval['warning']=(retrieval['warning']+' Ранее данные ответы модели исключены из запроса из-за найденной исправленной заметки.').strip()
+            # M4: точечная инвалидация вместо грубого «одна исправленная заметка
+            # → убрать все ответы Кумара» (аудит P1.2). Устаревшие факты
+            # находятся по цепочкам суперсессий найденных заметок и по
+            # детерминированному лексическому отбору отозванных; исключаются
+            # только ответы, реально связанные с этими фактами.
+            stale=self.memory.stale_facts(text, matches, viewer_id=viewer)
+            excluded=[]
+            conflict_notice=None
+            if stale:
+                history,excluded=invalidate_history(history,stale)
+                conflict_notice=conflicting_facts_block(stale)
+                stale_note=', '.join('#'+str(f['note_id']) for f in stale[:3])
+                retrieval['warning']=(retrieval['warning']
+                    +f' Точечная инвалидация: исключено {len(excluded)} ответ(ов) Кумара, '
+                     f'связанных с устаревшими фактами ({stale_note}).').strip()
             with self.memory.lock:
                 row=self.memory.db.execute("SELECT value FROM state WHERE key='emotion'").fetchone()
             emotion=row[0] if row else 'neutral'
@@ -155,12 +171,14 @@ class Pipeline:
                 engine=StubLLM()
             else:
                 raise EngineError('Неизвестный движок диалога.')
-            answer=engine.generate(text, matches, history, emotion, cfg['thinking'])
+            answer=engine.generate(text, matches, history, emotion, cfg['thinking'], conflict_notice=conflict_notice)
             self.memory.save_exchange(viewer,text,answer)
             self.semantic.schedule()
             self.tts.synthesize(answer)
             return {'response':answer,'matches':matches,'mode':cfg['engine'],
                     'search_mode':retrieval['mode'], 'search_warning':retrieval['warning'],
+                    'conflicts':[{'note_id':f['note_id'],'status':f['status'],'text':f['text'],
+                                  'replacement':f['replacement'],'excluded_answers':len(excluded)} for f in stale],
                     'prompt_messages':getattr(engine,'last_messages',[]),
                     'usage':getattr(engine,'last_usage',{}),
                     'prompt_source':(f'local: config/character.md ({getattr(engine,"persona_sha","")})'
@@ -384,8 +402,9 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
             return result
         except SemanticError as exc: raise HTTPException(502,str(exc)) from exc
     @app.get('/api/notes')
-    def notes() -> list[dict[str, Any]]:
-        return app.state.memory.notes()
+    def notes(include_history: bool=False) -> list[dict[str, Any]]:
+        """M4: по умолчанию только активные и спорные; ?include_history=true — вся история."""
+        return app.state.memory.notes(include_history=include_history)
     @app.post('/api/notes',dependencies=[Depends(admin_guard)])
     def add_note(payload: TextInput) -> dict[str, int]:
         text=payload.text.strip()
@@ -397,7 +416,7 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
         app.state.pipeline.semantic.schedule()
         return {'id':note_id}
     @app.put('/api/notes/{note_id}',dependencies=[Depends(admin_guard)])
-    def edit_note(note_id: int, payload: TextInput) -> dict[str,bool]:
+    def edit_note(note_id: int, payload: TextInput) -> dict[str,Any]:
         text=payload.text.strip()
         if not text or payload.revision is None: raise HTTPException(400,'Введите текст и версию заметки')
         if payload.memory_type not in MEMORY_TYPES:
@@ -408,11 +427,20 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
         except ValueError as exc: raise HTTPException(409,str(exc)) from exc
         if not found: raise HTTPException(404,'Заметка не найдена')
         app.state.pipeline.semantic.schedule()
-        return {'updated':True}
+        return {'updated':True,'mode':found['mode'],'old_id':found['old_id'],'new_id':found['new_id']}
     @app.delete('/api/notes/{note_id}',dependencies=[Depends(admin_guard)])
-    def delete_note(note_id: int) -> dict[str,Any]:
-        """M4: мягкое отзывание (retracted) с сохранением истории."""
-        result=app.state.memory.delete_note(note_id)
+    def delete_note(note_id: int, hard: bool=False) -> dict[str,Any]:
+        """M4: мягкое отзывание; ?hard=true — физическое удаление (PII, нарушения)."""
+        result=app.state.memory.delete_note(note_id,hard=hard)
+        if not result: raise HTTPException(404,'Заметка не найдена')
+        app.state.pipeline.semantic.schedule()
+        return result
+    @app.post('/api/notes/{note_id}/status',dependencies=[Depends(admin_guard)])
+    def note_status(note_id: int, payload: NoteStatusInput) -> dict[str,Any]:
+        """M4: ручная кураторская пометка оператора (disputed/active/retracted)."""
+        try:
+            result=app.state.memory.set_note_status(note_id,payload.status)
+        except ValueError as exc: raise HTTPException(409,str(exc)) from exc
         if not result: raise HTTPException(404,'Заметка не найдена')
         app.state.pipeline.semantic.schedule()
         return result

@@ -87,18 +87,28 @@ def test_changed_note_retrieved_immediately_before_embedding_refresh(c):
     assert not any(x['kind']=='note' and 'деревянные' in x['text'] for x in out)
 
 def test_corrected_note_suppresses_old_assistant_history(c,monkeypatch):
+    """M4: точечная инвалидация вместо грубого удаления всей истории Кумара."""
     histories=[]
     from src.engines import StubLLM
-    def fake(self,text,context,history,emotion,thinking):
-        histories.append(history);return 'старый ответ'
+    def fake(self,text,context,history,emotion,thinking,conflict_notice=None):
+        histories.append((history,conflict_notice));return 'Ты собираешь кораблики'
     monkeypatch.setattr(StubLLM,'generate',fake)
     i=c.post('/api/notes',json={'text':'Мира собирает кораблики.','fact_key':'хобби'}).json()['id']
     c.post('/api/chat',json={'viewer':'alice','text':'Что ты собираешь?'})
+    # M4: правка содержания — суперсессия (старая строка помечается, новая активна).
     c.put(f'/api/notes/{i}',json={'text':'Мира собирает шарики.','fact_key':'хобби','revision':1})
     r=c.post('/api/chat',json={'viewer':'alice','text':'Что ты собираешь?'}).json()
-    assert any(x['speaker']=='viewer' for x in histories[-1])
-    assert not any(x['speaker']=='kumar' for x in histories[-1])
-    assert 'исключены' in r['search_warning']
+    history,notice=histories[-1]
+    assert any(x['speaker']=='viewer' for x in history)
+    # Исключён только ответ, связанный с устаревшим фактом 'кораблики';
+    # посторонние ответы Кумара остались бы в истории (тут он один и связан).
+    assert not any(x['speaker']=='kumar' for x in history)
+    assert 'исключено' in r['search_warning']
+    assert r['conflicts'] and r['conflicts'][0]['status']=='superseded'
+    assert r['conflicts'][0]['replacement']['body']=='Мира собирает шарики.'
+    assert notice and 'Ранее было сказано' in notice and 'шарики' in notice
+    # Разделение блока и reference_data как system-сообщений проверяется
+    # на уровне движков (tests/test_conflicts.py, OrcaRouterEngine + мок).
 
 def test_backstage_stream_memory_and_controls(c):
     assert c.get('/api/runtime/stream-memories').json()==[]
@@ -120,7 +130,7 @@ def test_backstage_stream_memory_and_controls(c):
 def test_backstage_fragment_is_sent_to_model_context(c,monkeypatch):
     contexts=[]
     from src.engines import StubLLM
-    def fake(self,text,context,history,emotion,thinking):
+    def fake(self,text,context,history,emotion,thinking,conflict_notice=None):
         contexts.append(context)
         return 'ответ Кумара'
     monkeypatch.setattr(StubLLM,'generate',fake)
