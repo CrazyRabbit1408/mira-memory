@@ -71,11 +71,13 @@ class EngineError(Exception):
 
 class LLMEngine(Protocol):
     """Интерфейс текстового движка."""
-    def generate(self, text: str, context: list[dict[str, Any]], history: list[dict[str, Any]], emotion: str, thinking: bool) -> str: ...
+    def generate(self, text: str, context: list[dict[str, Any]], history: list[dict[str, Any]],
+                 emotion: str, thinking: bool, conflict_notice: str | None = None) -> str: ...
 
 class StubLLM:
     """Тестовая реализация без языковой модели."""
-    def generate(self, text: str, context: list[dict[str, Any]], history: list[dict[str, Any]], emotion: str, thinking: bool) -> str:
+    def generate(self, text: str, context: list[dict[str, Any]], history: list[dict[str, Any]],
+                 emotion: str, thinking: bool, conflict_notice: str | None = None) -> str:
         """Вернуть явно помеченное тестовое сообщение."""
         return 'Тестовый ответ: сообщение получено. Настоящая модель пока не подключена.'
 
@@ -85,7 +87,8 @@ class OllamaEngine:
         if model not in MODELS: raise ValueError('Эта модель не разрешена в тестовой версии')
         self.model = model
 
-    def generate(self, text: str, context: list[dict[str, Any]], history: list[dict[str, Any]], emotion: str, thinking: bool) -> str:
+    def generate(self, text: str, context: list[dict[str, Any]], history: list[dict[str, Any]],
+                 emotion: str, thinking: bool, conflict_notice: str | None = None) -> str:
         """Собрать ограниченный контекст и вернуть только видимый ответ модели."""
         state=EMOTION_NAMES.get(emotion, EMOTION_NAMES['neutral'])
         persona=(ROOT/'config/character.md').read_text(encoding='utf-8')[:12000]
@@ -95,6 +98,10 @@ class OllamaEngine:
             # Старые заглушки — технические строки, не реальные слова Кумара.
             if item['speaker']=='kumar' and body.startswith('Тестовый ответ:'): continue
             messages.append({'role':'user' if item['speaker']=='viewer' else 'assistant','content':body})
+        if conflict_notice:
+            # M4: конфликты памяти — отдельное system-сообщение, не часть
+            # характера и не часть reference_data (решение заказчика).
+            messages.append({'role':'system','content':conflict_notice})
         if context:
             # Никакие приватные авторские файлы сюда не попадают: context берётся
             # только из разрешённого индекса. Это не защита от всех атак на LLM.
@@ -174,7 +181,7 @@ class OrcaRouterEngine:
         return self.session_id
 
     def generate(self, text: str, context: list[dict[str, Any]], history: list[dict[str, Any]],
-                 emotion: str, thinking: bool) -> str:
+                 emotion: str, thinking: bool, conflict_notice: str | None = None) -> str:
         state = EMOTION_NAMES.get(emotion, EMOTION_NAMES['neutral'])
         # Полный характер Кумара собирается локально из config/character.md
         # и отправляется в каждом запросе, а не предполагается «привязанным»
@@ -193,6 +200,11 @@ class OrcaRouterEngine:
                 continue
             messages.append({'role': 'user' if item['speaker'] == 'viewer' else 'assistant',
                              'content': body})
+        if conflict_notice:
+            # M4: блок конфликтов памяти идёт отдельным system-сообщением до
+            # reference_data. Характер (persona) не тронут: character.md —
+            # единственный источник личности, конфликтные факты — динамика.
+            messages.append({'role': 'system', 'content': conflict_notice})
         if context:
             items = [{
                 'источник': str(x['source'])[:200],
