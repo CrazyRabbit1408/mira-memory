@@ -141,3 +141,88 @@ def test_reset_session_rotates_session_id(key_env):
     assert new_id != first and new_id.startswith('kumar-panel-')
     engine.generate('два', [], [], 'neutral', False)
     assert seen['headers']['x-orcarouter-session-id'] == new_id
+
+
+# --- C6: ошибки HTTP, транспорта и некорректных ответов -------------------
+
+@pytest.mark.parametrize('status,expected', [
+    (401, 'API-ключ'),
+    (403, 'HTTP 403'),
+    (429, 'ограничила'),
+    (500, 'HTTP 500'),
+    (503, 'HTTP 503'),
+])
+def test_http_error_statuses(key_env, status, expected):
+    """Ошибки API превращаются в понятные EngineError без утечки ключа."""
+    engine, _ = capture(lambda request, status=status: httpx.Response(
+        status, json={'error': {'message': f'подробности сервера {status}'}}))
+    with pytest.raises(EngineError) as exc:
+        engine.generate('вопрос', [], [], 'neutral', False)
+    message = str(exc.value)
+    assert expected in message
+    assert API_KEY not in message
+
+
+def test_rate_limit_message_includes_detail(key_env):
+    engine, _ = capture(lambda request: httpx.Response(
+        429, json={'error': {'message': 'много запросов, подождите'}}))
+    with pytest.raises(EngineError, match='много запросов, подождите'):
+        engine.generate('вопрос', [], [], 'neutral', False)
+
+
+def test_timeout_raises_engine_error(key_env):
+    def handler(request):
+        raise httpx.ReadTimeout('simulated timeout', request=request)
+    engine, _ = make_engine(handler), {}
+    with pytest.raises(EngineError, match='120 секунд') as exc:
+        engine.generate('вопрос', [], [], 'neutral', False)
+    assert API_KEY not in str(exc.value)
+
+
+def test_connection_error_raises_engine_error(key_env):
+    def handler(request):
+        raise httpx.ConnectError('network unreachable', request=request)
+    engine = make_engine(handler)
+    with pytest.raises(EngineError, match='Не удалось подключиться') as exc:
+        engine.generate('вопрос', [], [], 'neutral', False)
+    assert API_KEY not in str(exc.value)
+
+
+def test_invalid_json_raises_engine_error(key_env):
+    engine, _ = capture(lambda request: httpx.Response(200, content='{это не json'.encode('utf-8')))
+    with pytest.raises(EngineError, match='некорректный ответ') as exc:
+        engine.generate('вопрос', [], [], 'neutral', False)
+    assert API_KEY not in str(exc.value)
+
+
+def test_empty_choices_raises_engine_error(key_env):
+    engine, _ = capture(lambda request: httpx.Response(200, json={'choices': []}))
+    with pytest.raises(EngineError, match='без текста'):
+        engine.generate('вопрос', [], [], 'neutral', False)
+
+
+def test_message_without_text_raises_engine_error(key_env):
+    engine, _ = capture(lambda request: httpx.Response(
+        200, json={'choices': [{'message': {'role': 'assistant'}}]}))
+    with pytest.raises(EngineError, match='без текста'):
+        engine.generate('вопрос', [], [], 'neutral', False)
+
+
+def test_thinking_only_answer_raises_engine_error(key_env):
+    """Ответ из одних тегов <think> не считается видимым ответом."""
+    engine, _ = capture(lambda request: httpx.Response(
+        200, json=ok_response('<think>рассуждение без ответа</think>')))
+    with pytest.raises(EngineError, match='не вернула видимый ответ'):
+        engine.generate('вопрос', [], [], 'neutral', False)
+
+
+def test_usage_is_recorded_on_success(key_env):
+    engine, _ = capture(lambda request: httpx.Response(200, json=ok_response()))
+    engine.generate('привет', [], [], 'neutral', False)
+    assert engine.last_usage == {'prompt_tokens': 42, 'completion_tokens': 7, 'total_tokens': 49}
+
+
+def test_successful_answer_is_returned_verbatim(key_env):
+    engine, _ = capture(lambda request: httpx.Response(
+        200, json=ok_response('Кумар: ну и вопрос, дружок.')))
+    assert engine.generate('привет', [], [], 'neutral', False) == 'Кумар: ну и вопрос, дружок.'
