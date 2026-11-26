@@ -1,5 +1,6 @@
 """Локальная панель управления тестовым прототипом."""
 from __future__ import annotations
+import hmac
 import io
 import json
 import os
@@ -13,7 +14,7 @@ import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -30,6 +31,20 @@ from .context import resolve_context
 from .scoring import safe_float
 
 EMOTIONS=['neutral','joy','sadness','fear','anger','surprise','contempt','disgust','love']
+
+def admin_guard(x_admin_token: str = Header(default='')) -> None:
+    """C4: минимальная защита изменяющих эндпоинтов admin-токеном.
+
+    Если KUMAR_ADMIN_TOKEN не задан (локальный прототип на 127.0.0.1),
+    проверка отключена. В LAN-режиме токен обязателен: см. предупреждение
+    в src/main.py. Токен нигде не логируется и не попадает в backup.
+    """
+    expected=os.getenv('KUMAR_ADMIN_TOKEN','').strip()
+    if not expected:
+        return
+    if not hmac.compare_digest(x_admin_token.strip().encode('utf-8'), expected.encode('utf-8')):
+        raise HTTPException(401,'Требуется корректный заголовок X-Admin-Token (KUMAR_ADMIN_TOKEN)')
+
 class ChatInput(BaseModel):
     """Тестовое сообщение."""
     viewer: str = Field(default='test-viewer', min_length=1, max_length=80)
@@ -260,21 +275,21 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
                 'disk':round((disk.total-disk.free)/disk.total*100,1) if disk.total else 0,
                 'disk_used':disk.total-disk.free,'disk_total':disk.total,
                 'gpu':gpu,'gpu_label':gpu_label,'ollama':'отключена проектом'}
-    @app.post('/api/runtime/reload')
+    @app.post('/api/runtime/reload',dependencies=[Depends(admin_guard)])
     def runtime_reload() -> dict[str, Any]:
         return app.state.pipeline.reload_llm()
-    @app.post('/api/runtime/tts/stop')
+    @app.post('/api/runtime/tts/stop',dependencies=[Depends(admin_guard)])
     def runtime_tts_stop() -> dict[str, Any]:
         app.state.pipeline.tts.stop()
         return {'stopped':True}
-    @app.post('/api/runtime/tts/resume')
+    @app.post('/api/runtime/tts/resume',dependencies=[Depends(admin_guard)])
     def runtime_tts_resume() -> dict[str, Any]:
         app.state.pipeline.tts.resume()
         return {'stopped':False}
     @app.get('/api/runtime/stream-memories')
     def stream_memories() -> list[dict[str, Any]]:
         return app.state.memory.stream_memories()
-    @app.post('/api/runtime/stream-memories')
+    @app.post('/api/runtime/stream-memories',dependencies=[Depends(admin_guard)])
     def add_stream_memory(payload: StreamMemoryInput) -> dict[str, Any]:
         text=payload.text.strip()
         if not text: raise HTTPException(400,'Введите текст фрагмента')
@@ -292,12 +307,12 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
         )
         app.state.pipeline.semantic.schedule()
         return {'id':fragment_id,'persistent':False,'message':'Фрагмент добавлен в текущий эфир.'}
-    @app.delete('/api/runtime/stream-memories')
+    @app.delete('/api/runtime/stream-memories',dependencies=[Depends(admin_guard)])
     def clear_stream_memories() -> dict[str, Any]:
         count=app.state.memory.clear_stream_memories()
         app.state.pipeline.semantic.schedule()
         return {'cleared':count}
-    @app.post('/api/engine-settings')
+    @app.post('/api/engine-settings',dependencies=[Depends(admin_guard)])
     def engine_settings(payload: EngineSettingsInput) -> dict[str, Any]:
         if payload.engine=='orcarouter' and payload.model not in ORCA_MODELS:
             raise HTTPException(400,'Недопустимая модель OrcaRouter')
@@ -313,7 +328,7 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
     @app.get('/api/messages')
     def messages() -> list[dict[str, Any]]:
         return app.state.memory.recent()
-    @app.delete('/api/messages/{message_id}')
+    @app.delete('/api/messages/{message_id}',dependencies=[Depends(admin_guard)])
     def delete_message(message_id: int) -> dict[str, bool]:
         m: MemoryManager=app.state.memory
         with m.lock, m.db:
@@ -340,7 +355,7 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
     @app.get('/api/semantic-status')
     def semantic_status() -> dict[str, Any]:
         return app.state.pipeline.semantic.status()
-    @app.post('/api/semantic-reindex')
+    @app.post('/api/semantic-reindex',dependencies=[Depends(admin_guard)])
     def semantic_reindex() -> dict[str, Any]:
         try:
             result=app.state.pipeline.semantic.build()
@@ -350,7 +365,7 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
     @app.get('/api/notes')
     def notes() -> list[dict[str, Any]]:
         return app.state.memory.notes()
-    @app.post('/api/notes')
+    @app.post('/api/notes',dependencies=[Depends(admin_guard)])
     def add_note(payload: TextInput) -> dict[str, int]:
         text=payload.text.strip()
         if not text: raise HTTPException(400,'Введите текст заметки')
@@ -360,7 +375,7 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
         except sqlite3.IntegrityError as exc: raise HTTPException(409,'Этот ключ уже занят. Измените существующую заметку.') from exc
         app.state.pipeline.semantic.schedule()
         return {'id':note_id}
-    @app.put('/api/notes/{note_id}')
+    @app.put('/api/notes/{note_id}',dependencies=[Depends(admin_guard)])
     def edit_note(note_id: int, payload: TextInput) -> dict[str,bool]:
         text=payload.text.strip()
         if not text or payload.revision is None: raise HTTPException(400,'Введите текст и версию заметки')
@@ -373,7 +388,7 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
         if not found: raise HTTPException(404,'Заметка не найдена')
         app.state.pipeline.semantic.schedule()
         return {'updated':True}
-    @app.delete('/api/notes/{note_id}')
+    @app.delete('/api/notes/{note_id}',dependencies=[Depends(admin_guard)])
     def delete_note(note_id: int) -> dict[str,bool]:
         if not app.state.memory.delete_note(note_id): raise HTTPException(404,'Заметка не найдена')
         app.state.pipeline.semantic.schedule()
@@ -381,7 +396,7 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
     @app.get('/api/lore')
     def lore_list() -> list[dict[str, Any]]:
         return app.state.memory.lore_chunks()
-    @app.post('/api/lore/reindex')
+    @app.post('/api/lore/reindex',dependencies=[Depends(admin_guard)])
     def reindex() -> dict[str,int]:
         m=app.state.memory
         with m.lock, m.db: knowledge.sync_graph(m.db,m.lore)
@@ -397,7 +412,7 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
     def candidates() -> list[dict[str,Any]]:
         m=app.state.memory
         with m.lock: return [dict(r) for r in m.db.execute('SELECT * FROM memory_candidates ORDER BY id DESC LIMIT 200')]
-    @app.post('/api/candidates/{candidate_id}/{decision}')
+    @app.post('/api/candidates/{candidate_id}/{decision}',dependencies=[Depends(admin_guard)])
     def candidate_decision(candidate_id: int, decision: str) -> dict[str,bool]:
         if decision not in ('approved','rejected','pending'): raise HTTPException(400,'Неизвестное решение')
         m=app.state.memory
@@ -411,7 +426,7 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
         with m.lock: return [dict(r) for r in m.db.execute('''SELECT revision,body,viewer_id,fact_key,
             memory_type,importance,source_kind,confidence,created FROM note_versions
             WHERE note_id=? ORDER BY revision DESC''',(note_id,))]
-    @app.post('/api/demo')
+    @app.post('/api/demo',dependencies=[Depends(admin_guard)])
     def load_demo() -> dict[str,int]:
         m=app.state.memory
         with m.lock:
@@ -430,14 +445,14 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
                 m.db.execute("INSERT INTO state(key,value) VALUES('demo_loaded','1')")
         app.state.pipeline.semantic.schedule()
         return {'exchanges':len(data)}
-    @app.post('/api/emotion')
+    @app.post('/api/emotion',dependencies=[Depends(admin_guard)])
     def set_emotion(payload: EmotionInput) -> dict[str,str]:
         if payload.emotion not in EMOTIONS: raise HTTPException(400,'Неизвестная эмоция')
         m: MemoryManager=app.state.memory
         with m.lock,m.db:
             m.db.execute("INSERT INTO state(key,value) VALUES('emotion',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(payload.emotion,))
         return {'emotion':payload.emotion}
-    @app.get('/api/backup')
+    @app.get('/api/backup',dependencies=[Depends(admin_guard)])
     def backup() -> Response:
         """Скачать согласованную копию данных; без токенов и поискового индекса."""
         m: MemoryManager=app.state.memory

@@ -1,7 +1,12 @@
 'use strict';
 const $=s=>document.querySelector(s);
 const element=(tag,text,cls)=>{const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e};
-async function api(path,options={}){const r=await fetch(path,{...options,headers:{'Content-Type':'application/json',...(options.headers||{})}});if(!r.ok){let detail='Ошибка '+r.status;try{const j=await r.json();if(typeof j.detail==='string')detail=j.detail}catch(_){}throw Error(detail)}return r.json()}
+// C4: admin-токен хранится только в localStorage браузера и отправляется
+// заголовком X-Admin-Token на изменяющие эндпоинты, когда он задан в .env.
+function adminToken(){try{return window.localStorage.getItem('kumar-admin-token')||''}catch(_){return ''}}
+function storeAdminToken(value){try{if(value)window.localStorage.setItem('kumar-admin-token',value);else window.localStorage.removeItem('kumar-admin-token')}catch(_){}}
+async function apiFetch(path,options={}){const headers={'Content-Type':'application/json',...(options.headers||{})};const token=adminToken();if(token)headers['X-Admin-Token']=token;const r=await fetch(path,{...options,headers});if(!r.ok){let detail='Ошибка '+r.status;try{const j=await r.json();if(typeof j.detail==='string')detail=j.detail}catch(_){}if(r.status===401&&/admin|токен/i.test(detail)){const t=window.prompt('Введите admin-токен (значение KUMAR_ADMIN_TOKEN из .env):','');if(t!==null){storeAdminToken(t.trim());return apiFetch(path,options)}}throw Error(detail)}return r}
+async function api(path,options={}){return (await apiFetch(path,options)).json()}
 let toastTimer;function toast(text){const t=$('#toast');t.textContent=text;t.classList.add('visible');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove('visible'),4000)}
 function empty(box,text){box.replaceChildren(element('div',text,'empty'))}
 function renderMatches(selector,items){const box=$(selector);box.replaceChildren();if(!items.length){empty(box,'Совпадений не найдено.');return}for(const m of items){const d=element('div',undefined,'item');d.append(element('small',m.source+' · '+m.kind+(m['поиск']?' · '+m['поиск']:'')+(typeof m.distance==='number'?' · расстояние '+m.distance:'')),element('p',m.text));box.append(d)}}
@@ -123,3 +128,6 @@ $('#tts-stop').onclick=async()=>{try{await api('/api/runtime/tts/stop',{method:'
 $('#tts-resume').onclick=async()=>{try{await api('/api/runtime/tts/resume',{method:'POST'});await refresh();toast('TTS снова разрешён')}catch(e){toast(e.message)}};
 $('#stream-memory-form').onsubmit=async e=>{e.preventDefault();try{const r=await api('/api/runtime/stream-memories',{method:'POST',body:JSON.stringify({text:$('#stream-memory-text').value,memory_type:$('#stream-memory-type').value,fragment_kind:$('#stream-memory-kind').value,importance:.9,persistent:$('#stream-memory-persistent').checked})});$('#stream-memory-text').value='';await refresh();toast(r.message)}catch(err){toast(err.message)}};
 $('#clear-stream-memories').onclick=async()=>{if(!confirm('Очистить только временные фрагменты текущего эфира?'))return;try{const r=await api('/api/runtime/stream-memories',{method:'DELETE'});await refresh();toast(`Эфир завершён. Очищено: ${r.cleared}`)}catch(e){toast(e.message)}};
+
+// C4/C3: копия скачивается через fetch с admin-токеном; ссылка без токена больше не работает.
+const backupLink=$('#backup-download');if(backupLink)backupLink.addEventListener('click',async e=>{e.preventDefault();const b=backupLink;b.style.opacity='0.6';try{const r=await apiFetch('/api/backup');const blob=await r.blob();const url=URL.createObjectURL(blob);const a=element('a');a.href=url;a.download='memory-lab-backup.zip';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);toast('Копия скачана')}catch(err){toast(err.message)}finally{b.style.opacity=''}});
