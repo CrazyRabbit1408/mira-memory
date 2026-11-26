@@ -447,9 +447,12 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
             with zipfile.ZipFile(buf,'w',compression=zipfile.ZIP_DEFLATED) as z:
                 z.write(db,'data/memory.sqlite3')
                 z.writestr('backup-info.json',json.dumps({'format_version':1},ensure_ascii=False))
-                for root,arc in [(lore_path,'config/lore/character'),(ROOT/'reference','reference')]:
-                    for f in root.glob('*.md'):
-                        if f.is_file() and not f.is_symlink(): z.write(f,f'{arc}/{f.name}')
+                # reference/* в обычный backup не попадает: там живёт приватный
+                # авторский архив (author-private.md и т.п.), который персонажу
+                # запрещено знать. Restore по-прежнему принимает старые архивы
+                # с reference/*.md для обратной совместимости.
+                for f in lore_path.glob('*.md'):
+                    if f.is_file() and not f.is_symlink(): z.write(f,f'config/lore/character/{f.name}')
                 z.write(ROOT/'config/config.yaml','config/config.yaml')
                 z.write(ROOT/'config/character.md','config/character.md')
                 z.write(ROOT/'config/name.txt','config/name.txt')

@@ -108,6 +108,27 @@ def test_backup_restore(client,tmp_path):
     db=sqlite3.connect(dest/'data/memory.sqlite3');assert db.execute('select body from notes').fetchone()[0]=='Заметка для копии';db.close()
     with pytest.raises(ValueError):restore(archive,dest)
 
+def test_backup_excludes_reference(client):
+    """C3: обычный backup не содержит reference/* (в т.ч. author-private.md)."""
+    with zipfile.ZipFile(io.BytesIO(client.get('/api/backup').content)) as z:
+        names=z.namelist()
+        assert all(not n.startswith('reference/') for n in names)
+        assert 'config/character.md' in names
+
+def test_backup_never_contains_private_author_file(client,tmp_path,monkeypatch):
+    """Даже если в reference/ лежит приватный файл, в архив он не попадает."""
+    fake=tmp_path/'fake-root';(fake/'reference').mkdir(parents=True);(fake/'config').mkdir()
+    (fake/'reference'/'author-private.md').write_text('АВТОРСКИЙ СЕКРЕТ-МАРКЕР',encoding='utf8')
+    for name in ('config.yaml','character.md','name.txt','graph.json'):
+        (fake/'config'/name).write_text('заглушка',encoding='utf8')
+    monkeypatch.setattr('src.app.ROOT',fake)
+    data=client.get('/api/backup').content
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        names=z.namelist()
+        assert all(not n.startswith('reference/') for n in names)
+        assert all('АВТОРСКИЙ СЕКРЕТ-МАРКЕР' not in z.read(n).decode('utf8','ignore') for n in names)
+        assert 'config/lore/character/world.md' in names
+
 def test_reject_malicious_archive(client,tmp_path):
     raw=client.get('/api/backup').content
     with zipfile.ZipFile(io.BytesIO(raw)) as source:
