@@ -7,6 +7,14 @@ M4: заметки имеют явный жизненный цикл факта 
 superseded_by_id). Правка содержания создаёт новую строку и помечает старую
 (status='superseded'), ничего не удаляя: история изменений сохраняется
 полностью и остаётся видимой через цепочки суперсессий.
+
+M2: заметки дополнительно индексируются полнотекстовым индексом FTS5
+(notes_fts: body, fact_key, viewer_id; tokenizer=unicode61). Индекс —
+производные данные: он всегда перестраивается из notes (M1, честный
+rebuild_index) и синхронизируется триггерами на каждой правке. Поиск
+идёт по BM25-рангу с префиксными запросами (морфология русского языка)
+и фильтром жизненного цикла M4: по умолчанию — только текущая правда
+(active/disputed), история — по явному include_history=True.
 """
 from __future__ import annotations
 import hashlib
@@ -22,6 +30,32 @@ from chromadb.config import Settings
 from .embeddings import stub_embedding, tokens
 from .scoring import safe_float, message_relates_to_fact
 from . import knowledge
+
+# M2: маркеры подсветки для snippet(). Символы Private Use Area не встречаются
+# в обычном тексте: фронтенд экранирует HTML сниппета и только потом превращает
+# их в <mark>, поэтому подсветка не может протащить разметку из тела заметки.
+SNIPPET_OPEN = '\ue000'
+SNIPPET_CLOSE = '\ue001'
+
+# Схема и триггеры FTS5-индекса заметок. rowid = notes.id; колонки — копии
+# (NOT body NULL в notes, NULL-ключи и зрители заменяются пустой строкой).
+FTS_TABLE_SQL = ("CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5("
+                 "body, fact_key, viewer_id, tokenize='unicode61')")
+FTS_TRIGGER_SQLS = (
+    '''CREATE TRIGGER IF NOT EXISTS notes_fts_ai AFTER INSERT ON notes BEGIN
+        INSERT INTO notes_fts(rowid,body,fact_key,viewer_id)
+        VALUES(new.id,new.body,COALESCE(new.fact_key,''),COALESCE(new.viewer_id,''));
+    END''',
+    '''CREATE TRIGGER IF NOT EXISTS notes_fts_ad AFTER DELETE ON notes BEGIN
+        DELETE FROM notes_fts WHERE rowid=old.id;
+    END''',
+    '''CREATE TRIGGER IF NOT EXISTS notes_fts_au AFTER UPDATE ON notes BEGIN
+        DELETE FROM notes_fts WHERE rowid=old.id;
+        INSERT INTO notes_fts(rowid,body,fact_key,viewer_id)
+        VALUES(new.id,new.body,COALESCE(new.fact_key,''),COALESCE(new.viewer_id,''));
+    END''',
+)
+
 
 MEMORY_TYPES = frozenset({
     'fact', 'preference', 'relationship', 'event',
@@ -106,6 +140,7 @@ class MemoryManager:
             if version_columns and name not in version_columns:
                 self.db.execute(f'ALTER TABLE note_versions ADD COLUMN {name} {decl}')
         self._migrate_note_lifecycle()
+        self._migrate_fts_index()
         # Эфирные фрагменты не должны неожиданно переживать полный перезапуск
         # панели: постоянный канон хранится в notes, а этот слой относится к
         # текущему эфиру.
@@ -191,6 +226,144 @@ class MemoryManager:
                            'kept_id': keeper['id'],
                            'superseded_ids': sorted(s['id'] for s in items[1:])})
         return report
+
+    def _ensure_fts_schema(self) -> None:
+        """Создать (или пересоздать) схему FTS5-индекса.
+
+        Триггеры всегда пересоздаются: если notes_fts была удалена вручную
+        (M1-тест «принудительное удаление индекса»), оставшиеся триггеры
+        ссылались бы на несуществующую таблицу и роняли бы каждую правку
+        заметок. CREATE TRIGGER IF NOT EXISTS этого не заметил бы.
+        """
+        self.db.execute(FTS_TABLE_SQL)
+        for name in ('notes_fts_ai', 'notes_fts_ad', 'notes_fts_au'):
+            self.db.execute(f'DROP TRIGGER IF EXISTS {name}')
+        for sql in FTS_TRIGGER_SQLS:
+            self.db.execute(sql)
+
+    def _rebuild_fts(self) -> int:
+        """M2: полная пересборка notes_fts из notes (источник истины).
+
+        Индекс — производные данные, потеря или рассинхронизация не
+        считается повреждением памяти: метод чистит таблицу и заново
+        копирует все строки notes. Возвращает число проиндексированных
+        заметок.
+        """
+        with self.lock, self.db:
+            self._ensure_fts_schema()
+            self.db.execute('DELETE FROM notes_fts')
+            self.db.execute('''INSERT INTO notes_fts(rowid,body,fact_key,viewer_id)
+                SELECT id,body,COALESCE(fact_key,''),COALESCE(viewer_id,'') FROM notes''')
+            count = self.db.execute('SELECT COUNT(*) FROM notes_fts').fetchone()[0]
+        return int(count)
+
+    def _migrate_fts_index(self) -> None:
+        """M2: идемпотентная миграция — создать индекс и сверить его с notes.
+
+        На первой базе Этапа 0/M4 таблицы notes_fts нет — она создаётся и
+        заполняется всеми заметками. При последующих запусках сравнивается
+        число строк: расхождение (падение питания, внешние инструменты,
+        ручное удаление) означает рассинхронизацию — индекс перестраивается
+        из notes, молчаливо оставить битый индекс нельзя.
+        """
+        with self.lock, self.db:
+            self._ensure_fts_schema()
+            fts_count = self.db.execute('SELECT COUNT(*) FROM notes_fts').fetchone()[0]
+            notes_count = self.db.execute('SELECT COUNT(*) FROM notes').fetchone()[0]
+            if fts_count != notes_count:
+                self.db.execute('DELETE FROM notes_fts')
+                self.db.execute('''INSERT INTO notes_fts(rowid,body,fact_key,viewer_id)
+                    SELECT id,body,COALESCE(fact_key,''),COALESCE(viewer_id,'') FROM notes''')
+                self.db.execute("INSERT INTO state(key,value) VALUES('m2_fts',?) "
+                                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                (json.dumps({'version': 1, 'notes': notes_count,
+                                             'rebuilt_at_startup': True},
+                                            ensure_ascii=False),))
+
+    @staticmethod
+    def fts_match_expression(query: str) -> str:
+        """M2: превратить текст запроса в безопасное MATCH-выражение FTS5.
+
+        Из запроса берутся только \\w-токены (кавычки, двоеточия и операторы
+        FTS5 не могут проникнуть в выражение), каждый токен становится
+        префиксным фраз-запросом — так unicode61 даёт морфологию русского:
+        «кумара» находит «Кумар», «корабли» — «кораблей». Для длинных слов
+        добавляется префикс первых трёх символов (основы): «люблю» находит
+        «любимый», «читал» — «читает». Токены объединяются через AND.
+        """
+        found = re.findall(r'\w+', query, flags=re.UNICODE)[:8]
+        clauses = []
+        for tok in found:
+            if len(tok) >= 4:
+                clauses.append(f'("{tok}"* OR "{tok[:3]}"*)')
+            else:
+                clauses.append(f'"{tok}"*')
+        return ' AND '.join(clauses)
+
+    def search_notes(self, query: str, limit: int = 20, viewer_id: str | None = None,
+                     include_history: bool = False) -> list[dict[str, Any]]:
+        """M2: полнотекстовый поиск по заметкам (FTS5 + BM25-ранжирование).
+
+        Индексируются body, fact_key и viewer_id заметок; ранжирование —
+        bm25(notes_fts) (меньше — лучше), сниппет — snippet() с маркерами
+        SNIPPET_OPEN/SNIPPET_CLOSE для безопасной подсветки на фронтенде.
+
+        Интеграция с M4: по умолчанию ищется только «текущая правда» —
+        active и disputed (disputed остаётся текущим фактом, спор не
+        инвалидирует его, см. модель конфликтов). include_history=True
+        добавляет superseded и retracted версии (поиск по истории).
+
+        Заметки зрителя и общие заметки доступны при заданном viewer_id;
+        чужие заметки не выдаются никогда.
+        """
+        match = self.fts_match_expression(query)
+        if not match:
+            return []
+        cap = max(1, min(int(limit), 100))
+        statuses = ('active', 'superseded', 'disputed', 'retracted') if include_history \
+            else ('active', 'disputed')
+        # Дополнение до четырёх плейсхолдеров: пустая строка не совпадает
+        # ни с одним статусом, поэтому IN-фильтр остаётся честным.
+        padded = tuple(statuses) + ('',) * (4 - len(statuses))
+        with self.lock:
+            rows = self.db.execute('''
+                SELECT n.id, n.body, n.created, n.viewer_id, n.fact_key, n.revision,
+                    n.memory_type, n.importance, n.source_kind, n.confidence,
+                    n.status, n.valid_from, n.valid_to, n.superseded_by_id,
+                    f.fts_rank, f.snippet
+                FROM (SELECT rowid AS note_rowid,
+                             bm25(notes_fts) AS fts_rank,
+                             snippet(notes_fts, 0, :snippet_open, :snippet_close, '…', 12) AS snippet
+                      FROM notes_fts WHERE notes_fts MATCH :match) f
+                JOIN notes n ON n.id = f.note_rowid
+                WHERE n.status IN (:s0,:s1,:s2,:s3)
+                  AND (:viewer_id IS NULL OR COALESCE(n.viewer_id,'') IN ('', :viewer_id))
+                ORDER BY f.fts_rank, n.id DESC
+                LIMIT :limit
+            ''', {'snippet_open': SNIPPET_OPEN, 'snippet_close': SNIPPET_CLOSE,
+                  'match': match, 's0': padded[0], 's1': padded[1],
+                  's2': padded[2], 's3': padded[3],
+                  'viewer_id': (viewer_id or '').strip() or None,
+                  'limit': cap}).fetchall()
+            return [{'id': r['id'], 'body': r['body'], 'created': r['created'],
+                     'viewer_id': r['viewer_id'], 'fact_key': r['fact_key'],
+                     'revision': r['revision'], 'memory_type': r['memory_type'] or 'fact',
+                     'importance': safe_float(r['importance'], 0.5),
+                     'source_kind': r['source_kind'] or 'owner',
+                     'confidence': safe_float(r['confidence'], 1.0),
+                     'status': r['status'] or 'active', 'valid_to': r['valid_to'],
+                     'superseded_by_id': r['superseded_by_id'],
+                     'fts_rank': round(r['fts_rank'], 6), 'snippet': r['snippet'],
+                     'source': f'Заметка #{r["id"]}'}
+                    for r in rows]
+
+    def fts_count(self) -> int:
+        """M2: число строк в полнотекстовом индексе (диагностика честного rebuild)."""
+        with self.lock:
+            try:
+                return int(self.db.execute('SELECT COUNT(*) FROM notes_fts').fetchone()[0])
+            except sqlite3.OperationalError:
+                return 0  # индекс отсутствует — честно сообщаем нулём
 
     def close(self) -> None:
         """Закрыть базу данных."""
@@ -501,6 +674,10 @@ class MemoryManager:
             row=self.db.execute('SELECT status FROM notes WHERE id=?',(note_id,)).fetchone()
             if not row: return None
             if hard:
+                # M4/M2: физическое удаление обязано работать и тогда, когда
+                # другие строки цепочки ссылаются на удаляемую заметку через
+                # superseded_by_id — иначе FK не пускает удаление PII.
+                self.db.execute('UPDATE notes SET superseded_by_id=NULL WHERE superseded_by_id=?',(note_id,))
                 if self.db.execute('DELETE FROM notes WHERE id=?',(note_id,)).rowcount>0:
                     result={'mode':'hard','note_id':note_id}
             else:
@@ -584,6 +761,7 @@ class MemoryManager:
                     'viewers':self.db.execute('SELECT COUNT(*) FROM viewers').fetchone()[0],
                     'notes':self.db.execute('SELECT COUNT(*) FROM notes').fetchone()[0],
                     'active_notes':self.db.execute("SELECT COUNT(*) FROM notes WHERE status='active'").fetchone()[0],
+                    'fts_notes':self.fts_count(),
                     'note_statuses':{r['status'] or 'active':r['count'] for r in status_rows},
                     'stream_memories':self.db.execute(
                         'SELECT COUNT(*) FROM stream_memories WHERE active=1').fetchone()[0],

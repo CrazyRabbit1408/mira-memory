@@ -405,6 +405,23 @@ def create_app(directory: Path | None=None, lore: Path | None=None, testing: boo
     def notes(include_history: bool=False) -> list[dict[str, Any]]:
         """M4: по умолчанию только активные и спорные; ?include_history=true — вся история."""
         return app.state.memory.notes(include_history=include_history)
+    @app.get('/api/notes/search')
+    def notes_search(q: str='', limit: int=20, viewer_id: str | None=None,
+                     include_history: bool=False) -> dict[str, Any]:
+        """M2: полнотекстовый поиск по заметкам (FTS5 + BM25 + сниппеты).
+
+        Только чтение, admin-токен не требуется (как /api/search).
+        По умолчанию — текущая правда (active/disputed); ?include_history=true
+        подключает superseded и retracted версии. Сниппет содержит маркеры
+        \\ue000/\\ue001 вокруг совпадений — фронтенд превращает их в <mark>
+        после экранирования HTML.
+        """
+        query=q.strip()[:300]
+        try: cap=max(1,min(int(limit),100))
+        except ValueError: cap=20
+        results=app.state.memory.search_notes(query, limit=cap, viewer_id=viewer_id,
+                                              include_history=include_history)
+        return {'query':query, 'count':len(results), 'mode':'fts5', 'results':results}
     @app.post('/api/notes',dependencies=[Depends(admin_guard)])
     def add_note(payload: TextInput) -> dict[str, int]:
         text=payload.text.strip()
